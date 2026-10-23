@@ -289,6 +289,18 @@ export class SourcesStack extends SCLStack {
     // ================================================================
     // ECR repo context (shared between database enrichment + documents)
     // ================================================================
+    // Hosts a TRINO source's `uri` may resolve to a private address on. Empty means
+    // no Trino source is creatable or scannable — the allowlist IS the feature's off
+    // switch, so a separate enable flag would be a second gate able to disagree.
+    const trinoAllowedHosts =
+      (this.node.tryGetContext("trino_allowed_hosts") as
+        | string[]
+        | string
+        | undefined) ?? [];
+    const trinoAllowedHostsCsv = Array.isArray(trinoAllowedHosts)
+      ? trinoAllowedHosts.join(",")
+      : String(trinoAllowedHosts);
+
     const ecrRepositoryArn = this.node.tryGetContext("ecr_repository_arn") as
       | string
       | undefined;
@@ -680,6 +692,9 @@ export class SourcesStack extends SCLStack {
         // here before a merge overwrites live assets, and read back by the
         // bulk-review worker on approve/reject. Same bucket as the API/worker.
         BUCKET_NAME: sourcesBucket.bucketName,
+        // Read by the Trino connector, which re-guards the coordinator URI on every
+        // scan: an allowlisted host can be re-pointed after the source exists.
+        TRINO_ALLOWED_HOSTS: trinoAllowedHostsCsv,
       },
     });
 
@@ -2948,6 +2963,9 @@ export class SourcesStack extends SCLStack {
         SMUS_DOMAIN_ID: domainId,
         PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
         FEDERATION_PROVISIONER_ROLE_ARN: federationProvisionerFn.role!.roleArn,
+        // Read by `_validate_trino_configuration`, which refuses a Trino source
+        // whose `uri` resolves outside this list.
+        TRINO_ALLOWED_HOSTS: trinoAllowedHostsCsv,
         // Feeds `_build_catalog_name`, which derives the per-source Athena
         // data-catalog name registered at source create. Without it the handler
         // falls back to its hard-coded `coa-dev-` default in every environment.

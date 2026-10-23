@@ -23,7 +23,10 @@ which is what makes the ``SELECT *`` guard possible.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from coa_common.domain_models import EnrichmentSource
@@ -93,6 +96,16 @@ class FakeRunner:
     def discovery_statements(self) -> list[str]:
         """Statements excluding the schema resolution, which is not a scan query."""
         return [s for s in self.statements if "information_schema.schemata" not in s]
+
+
+@contextlib.contextmanager
+def _allowlisted(host: str):
+    """Allowlist ``host`` and resolve it to a private address, as in-VPC Trino is."""
+    with (
+        patch.dict(os.environ, {"TRINO_ALLOWED_HOSTS": host}, clear=False),
+        patch("coa_common.net.url_guard.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+    ):
+        yield
 
 
 def _col(table: str, name: str, dtype: str = "varchar", nullable: str = "YES", comment: str | None = None) -> list:
@@ -473,14 +486,39 @@ def test_connection_reports_a_catalog_error_that_is_not_a_missing_schema() -> No
 
 def test_the_default_runner_factory_builds_a_runner_from_config() -> None:
     """The production path: no factory injected, so config alone must suffice."""
-    connector = TrinoConnector()
-    runner = connector._runner_factory(dict(_CONFIG))  # noqa: SLF001 - the seam under test
+    with _allowlisted("trino.example.com"):
+        runner = TrinoConnector()._runner_factory(dict(_CONFIG))  # noqa: SLF001 - the seam under test
     assert (runner._host, runner._port) == ("trino.example.com", 8443)  # noqa: SLF001
 
 
 def test_the_default_runner_factory_surfaces_a_bad_secret_as_a_config_error() -> None:
-    with pytest.raises(TrinoConfigError):
+    with _allowlisted("trino.example.com"), pytest.raises(TrinoConfigError):
         TrinoConnector()._runner_factory(dict(_CONFIG, secret={}))  # noqa: SLF001 - the seam under test
+
+
+def test_every_scan_re_guards_the_uri() -> None:
+    """An allowlisted host can be re-pointed after the source exists, and each scan
+    is a fresh server-side fetch."""
+    with _allowlisted("someone-else.example.com"), pytest.raises(TrinoConfigError, match="allowlisted"):
+        TrinoConnector()._runner_factory(dict(_CONFIG))  # noqa: SLF001 - the seam under test
+
+
+def test_an_unset_allowlist_blocks_a_scan() -> None:
+    """Fail-closed at scan time too, not only at registration."""
+    with patch.dict(os.environ, {"TRINO_ALLOWED_HOSTS": ""}, clear=False), pytest.raises(TrinoConfigError):
+        TrinoConnector()._runner_factory(dict(_CONFIG))  # noqa: SLF001 - the seam under test
+
+
+def test_a_hard_denied_address_is_refused_at_scan_even_if_allowlisted() -> None:
+    with (
+        patch.dict(os.environ, {"TRINO_ALLOWED_HOSTS": "trino.example.com"}, clear=False),
+        patch(
+            "coa_common.net.url_guard.socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("169.254.169.254", 0))],
+        ),
+        pytest.raises(TrinoConfigError),
+    ):
+        TrinoConnector()._runner_factory(dict(_CONFIG))  # noqa: SLF001 - the seam under test
 
 
 def test_connection_reports_a_config_error_before_any_network_call() -> None:

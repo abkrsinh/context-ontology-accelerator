@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -43,6 +44,7 @@ from coa_common.domain_models import (
     Table,
     TechnicalMetadata,
 )
+from coa_common.net import UrlGuardError, validate_url
 
 from coa_sources.database.metrics import emit_metric
 
@@ -122,10 +124,25 @@ def _compute_hash(columns: list[Column]) -> str:
     return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def _allowed_hosts() -> tuple[str, ...]:
+    """Hosts whose non-public addresses a coordinator URI may resolve to."""
+    return tuple(h.strip() for h in os.environ.get("TRINO_ALLOWED_HOSTS", "").split(",") if h.strip())
+
+
 def _default_runner_factory(config: dict) -> TrinoStatementRunner:
-    """Build a runner from a source's stored configuration."""
+    """Build a runner from a source's stored configuration.
+
+    The URI is re-guarded here, not just at create: an allowlisted hostname can
+    be re-pointed at a denied address after the source exists, and every scan is
+    a fresh server-side fetch.
+    """
+    uri = config.get("uri", "") or ""
+    try:
+        validate_url(uri, allowed_hosts=_allowed_hosts(), field_name="trinoConfiguration.uri")
+    except UrlGuardError as exc:
+        raise TrinoConfigError(str(exc)) from exc
     return TrinoStatementRunner(
-        uri=config.get("uri", ""),
+        uri=uri,
         auth_mode=config.get("auth_mode", ""),
         secret=config.get("secret") or {},
     )
