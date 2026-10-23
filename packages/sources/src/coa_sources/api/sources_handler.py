@@ -164,6 +164,7 @@ _DETAIL_CONFIG_KEYS: dict[str, str] = {
     SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
     SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
     SourceSubType.DATABRICKS_SQL_WAREHOUSE.value: "databricksSqlWarehouseConfiguration",
+    SourceSubType.TRINO.value: "trinoConfiguration",
 }
 
 # How a row this map does not cover is read: as Glue, which is how every

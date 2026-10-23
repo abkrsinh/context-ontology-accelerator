@@ -153,6 +153,7 @@ class DatabaseSubType(StrEnum):
     JDBC_DATABASE = "JDBC_DATABASE"
     CUSTOM_CONNECTOR = "CUSTOM_CONNECTOR"
     DATABRICKS_SQL_WAREHOUSE = "DATABRICKS_SQL_WAREHOUSE"
+    TRINO = "TRINO"
 
 
 DATABASE_SUB_TYPES: frozenset[str] = frozenset(s.value for s in DatabaseSubType)

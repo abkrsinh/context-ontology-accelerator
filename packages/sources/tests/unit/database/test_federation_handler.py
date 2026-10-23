@@ -357,6 +357,53 @@ class TestFederationHandler:
         assert out["queryable"] is False
 
 
+class TestTrinoBranch:
+    """A Trino source has no Glue catalog to provision and no Lake Formation grant to
+    make — serve reaches its tables over the same coordinator discovery read. The skip is
+    an explicit branch rather than a fallthrough so the scan record says why."""
+
+    _ITEM = {"sourceSubType": "TRINO"}
+
+    def test_marks_the_source_queryable_with_a_recorded_reason(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "trino-native", "queryable": True}
+        assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
+        # Guards against a concurrently-deleted row being resurrected.
+        assert dao.update.call_args.kwargs["condition"] == "attribute_exists(PK)"
+
+    def test_provisions_no_glue_or_lake_formation_resources(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}.grant_consumer_select") as grant,
+            patch(f"{MODULE}.grant_consumer_select_native") as grant_native,
+            patch(f"{MODULE}.grant_iam_allowed_principals") as iam_grant,
+        ):
+            handler(_EVENT)
+        prov.assert_not_called()
+        grant.assert_not_called()
+        grant_native.assert_not_called()
+        iam_grant.assert_not_called()
+
+    def test_does_not_fall_through_to_the_not_jdbc_no_op(self):
+        """The no-op writes nothing, so a Trino source would scan cleanly and then stay
+        queryable=False with no other signal — the failure the tripwire exists to catch."""
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out["reason"] != "not-jdbc"
+        dao.update.assert_called_once()
+
+
 class TestCustomConnectorBranch:
     """A custom-connector source needs no provisioning here — its Lambda-backed
     Athena data catalog was registered at source-create, because this sub-type's

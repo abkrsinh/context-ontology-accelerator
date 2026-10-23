@@ -80,6 +80,7 @@ _HANDLED_SUB_TYPES = (
         {
             SourceSubType.GLUE_DATABASE.value,
             SourceSubType.JDBC_DATABASE.value,
+            SourceSubType.TRINO.value,
         }
     )
     | CONNECTOR_BACKED_SUB_TYPES
@@ -355,6 +356,22 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
             extra={"datasource_id": datasource_id, "sub_type": sub_type},
         )
         return {"provisioned": False, "reason": "connector-backed", "queryable": True}
+
+    # A Trino source has no Glue catalog to provision and no Lake Formation grant to
+    # make: serve reaches its tables over the same coordinator discovery just read, and
+    # Trino enforces its own authorization. Discovery having succeeded is the evidence
+    # for queryable, exactly as it is for the connector-backed arm above.
+    if sub_type == SourceSubType.TRINO:
+        _get_dao().update(
+            key=source_key,
+            update_fields={"queryable": True},
+            condition="attribute_exists(PK)",
+        )
+        logger.info(
+            "trino_source_marked_queryable",
+            extra={"datasource_id": datasource_id, "sub_type": sub_type},
+        )
+        return {"provisioned": False, "reason": "trino-native", "queryable": True}
 
     if sub_type != SourceSubType.JDBC_DATABASE:
         # An ABSENT sub-type is the benign case and must stay a no-op: a source

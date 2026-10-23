@@ -64,6 +64,7 @@ _DEFAULT_TIMEOUT = 120
 _CUSTOM_CONNECTOR_SUB_TYPE = DatabaseSubType.CUSTOM_CONNECTOR.value
 _DATABRICKS_SUB_TYPE = DatabaseSubType.DATABRICKS_SQL_WAREHOUSE.value
 _JDBC_SUB_TYPE = DatabaseSubType.JDBC_DATABASE.value
+_TRINO_SUB_TYPE = DatabaseSubType.TRINO.value
 
 # Only reached below by a LEGACY row: `POST /sources` used to copy the caller's
 # `glueConfiguration.athenaDataCatalogName` into the top-level system attribute and no
@@ -93,6 +94,8 @@ _CATALOG_PATH_LABELS = {
     _CUSTOM_CONNECTOR_SUB_TYPE: "custom_connector",
     _DATABRICKS_SUB_TYPE: "databricks_sql_warehouse",
     _JDBC_SUB_TYPE: "federated",
+    # Athena has no catalog for a Trino source: reaching here means the executor is unwired.
+    _TRINO_SUB_TYPE: "trino_fallback",
 }
 
 # Athena's name for the account's root Glue Data Catalog, and the value it assumes

@@ -48,6 +48,7 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 __all__ = [
     "CONNECTOR_BACKED_SUB_TYPES",
     "FEDERATED_TEARDOWN_SUB_TYPES",
+    "NO_CATALOG_TEARDOWN_SUB_TYPES",
     "PLATFORM_CATALOG_CLAIM_SUB_TYPES",
 ]
 
@@ -78,5 +79,15 @@ PLATFORM_CATALOG_CLAIM_SUB_TYPES: frozenset[str] = frozenset(
         SourceSubType.JDBC_DATABASE.value,
         SourceSubType.CUSTOM_CONNECTOR.value,
         SourceSubType.DATABRICKS_SQL_WAREHOUSE.value,
+    }
+)
+
+# Sub-types with nothing to tear down: no Athena catalog, no Glue connection, no Lake
+# Formation registration, no claimed catalog name. A third set rather than membership in
+# either teardown path, both of which would act on resources that were never created and
+# report success anyway.
+NO_CATALOG_TEARDOWN_SUB_TYPES: frozenset[str] = frozenset(
+    {
+        SourceSubType.TRINO.value,
     }
 )

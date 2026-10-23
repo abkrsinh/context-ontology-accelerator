@@ -142,6 +142,30 @@ string DatabricksCatalogName
 @length(min: 1, max: 255)
 string DatabricksSchemaName
 
+/// Trino coordinator URI: `https` only, host and optional port, no path. The
+/// pattern is a first gate, not the control — the value is caller-supplied and
+/// fetched server-side, so it also passes the shared SSRF guard at create and on
+/// every scan. ASCII-only hosts reject raw-unicode homographs before resolution.
+@pattern("^https://[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:\\d{1,5})?$")
+@length(min: 9, max: 512)
+string TrinoUri
+
+/// Trino catalog name, e.g. `iceberg`. An identifier, because it is interpolated
+/// into `information_schema` SQL and is the first part of the three-part
+/// `catalog.schema.table` reference serve-time SQL emits.
+@pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")
+@length(min: 1, max: 255)
+string TrinoCatalogName
+
+/// Trino schema within the catalog. Excluding `.` is what enforces the v1
+/// single-level-namespace rule: Trino rejects multi-level Iceberg namespaces
+/// unless `nested-namespace-enabled` is set, so a dotted value could only fail
+/// later and less clearly. Case-insensitive — discovery resolves the canonical
+/// spelling from `information_schema.schemata`.
+@pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")
+@length(min: 1, max: 255)
+string TrinoSchemaName
+
 /// AWS Lambda function ARN, optionally qualified with a version number, an
 /// alias, or `$LATEST`. Format:
 /// arn:{partition}:lambda:{region}:{account-id}:function:{name}[:{qualifier}]
@@ -215,6 +239,10 @@ enum QueryEngine {
     /// for Glue-backed sources; opt-in per source via
     /// GlueConfiguration.executionEngine).
     REDSHIFT
+
+    /// Query a Trino coordinator directly. No transpilation: the consumption
+    /// layer's canonical dialect is already Trino.
+    TRINO
 }
 
 /// JDBC database connection configuration.
@@ -428,6 +456,63 @@ structure DatabricksSqlWarehouseConfiguration {
     tableFilter: FilterPattern
 
     /// Exclude-filter applied to table names within databaseName, evaluated
+    /// after tableFilter.
+    tableExcludeFilter: FilterPattern
+}
+
+/// How this service authenticates to the Trino coordinator. There is
+/// deliberately no `NONE`: every source authenticates.
+///
+/// OAuth2 client-credentials is deliberately absent in v1. The Trino client's
+/// `OAuth2Authentication` implements only the interactive authorization-code
+/// flow — it takes a redirect handler and needs a human to open a URL — so
+/// machine-to-machine would mean fetching a token from an IdP endpoint, which is
+/// a second caller-supplied URL fetched server-side and therefore a second SSRF
+/// surface. Where an operator can mint a token, `JWT` already covers that case.
+/// Adding the member later is additive and needs no migration.
+enum TrinoAuthMode {
+    /// HTTP Basic against Trino's password authenticator.
+    BASIC
+
+    /// Static JWT bearer token.
+    JWT
+}
+
+/// Trino cluster configuration. Discovery reads the coordinator's
+/// `information_schema`; serve-time SQL executes on that same coordinator, so
+/// the names discovery records are the names queries use. Reaches whatever Trino
+/// federates — Iceberg REST catalogs, Hive metastore, Nessie, Delta, JDBC.
+///
+/// Trino's own fine-grained access control does NOT apply to queries from this
+/// service, which connects under one service identity. Scope the credential to
+/// exactly the catalogs and schemas the namespace should expose; see the Trino
+/// section of `external-docs/content/sources.md`.
+structure TrinoConfiguration {
+    @required
+    uri: TrinoUri
+
+    @required
+    catalog: TrinoCatalogName
+
+    @required
+    schemaName: TrinoSchemaName
+
+    /// Secret holding {"username", "password"} for BASIC or {"token"} for JWT.
+    /// A shape that contradicts authMode, or carries both modes' keys, is
+    /// rejected at registration rather than guessed. Must carry the
+    /// `<prefix>:namespace` tag listing this namespace, exactly as
+    /// JdbcConfiguration requires.
+    @required
+    credentialSecretArn: SecretArn
+
+    @required
+    authMode: TrinoAuthMode
+
+    /// Include-filter applied to table names within schemaName. Omit to
+    /// discover every table.
+    tableFilter: FilterPattern
+
+    /// Exclude-filter applied to table names within schemaName, evaluated
     /// after tableFilter.
     tableExcludeFilter: FilterPattern
 }
@@ -1026,6 +1111,11 @@ enum SourceSubType {
     /// name it is invoked under.
     DATABRICKS_SQL_WAREHOUSE
 
+    /// Structured: a Trino cluster, queried directly rather than through
+    /// Athena. The source is Trino itself, not the catalog beneath it, so one
+    /// sub-type reaches every catalog Trino federates.
+    TRINO
+
     /// Unstructured: S3 bucket prefix
     S3
 
@@ -1237,6 +1327,9 @@ structure CreateDatabaseSourceInput {
     /// DATABRICKS_SQL_WAREHOUSE sub-type.
     databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
 
+    /// Trino cluster config. Required for the TRINO sub-type.
+    trinoConfiguration: TrinoConfiguration
+
     /// Enable AI-powered business metadata enrichment (descriptions,
     /// synonyms, glossary terms, tags). Defaults to true. When false the
     /// scan pipeline skips the enrichment step and the source transitions
@@ -1344,6 +1437,9 @@ structure DatabaseSourceDetail {
     /// Populated for the DATABRICKS_SQL_WAREHOUSE sub-type; absent otherwise.
     databricksSqlWarehouseConfiguration: DatabricksSqlWarehouseConfiguration
 
+    /// Populated for the TRINO sub-type; absent otherwise.
+    trinoConfiguration: TrinoConfiguration
+
     /// Whether AI-powered business metadata enrichment runs for this source.
     /// Set at creation time and persisted with the source record. When false
     /// the scan pipeline skips the enrichment step and the source transitions
@@ -1353,9 +1449,11 @@ structure DatabaseSourceDetail {
     /// Preferred execution engine for single-source queries against this source.
     /// Read-only and system-set at creation: `JDBC` for direct (low-latency)
     /// execution, set only for engines with an implemented direct dialect
-    /// (PostgreSQL/Redshift today); otherwise `ATHENA` (native Glue, and JDBC
-    /// engines without a direct path yet). The consumption layer overrides this
-    /// to Athena for any query spanning multiple sources.
+    /// (PostgreSQL/Redshift today); `TRINO` for the TRINO sub-type; otherwise
+    /// `ATHENA` (native Glue, and JDBC engines without a direct path yet). The
+    /// consumption layer overrides this to Athena for any query spanning
+    /// multiple sources — which a TRINO source cannot satisfy, since Athena
+    /// cannot reach Trino-only tables.
     queryEngine: QueryEngine
 
     /// Number of tables discovered in the most recent scan.

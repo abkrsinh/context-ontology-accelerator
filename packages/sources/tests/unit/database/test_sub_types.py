@@ -15,6 +15,7 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
+    NO_CATALOG_TEARDOWN_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
 )
 
@@ -37,24 +38,38 @@ def test_the_shared_mirror_matches_the_generated_enum():
     assert CONNECTOR_BACKED_SUB_TYPES <= DATABASE_SUB_TYPES
 
 
-def test_every_database_sub_type_is_either_connector_backed_or_federated():
-    """The two teardown paths are mutually exclusive and between them must cover every
-    DATABASE sub-type, or a source's catalog is torn down by neither.
+def test_every_database_sub_type_has_a_declared_teardown_disposition():
+    """The three teardown dispositions are mutually exclusive and between them must cover
+    every DATABASE sub-type, or a source's catalog is torn down by none of them.
     """
-    covered = CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES
+    covered = CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES | NO_CATALOG_TEARDOWN_SUB_TYPES
     uncovered = _DATABASE_SUB_TYPES - covered
     assert not uncovered, (
-        f"DATABASE sub-type(s) {sorted(uncovered)} belong to neither teardown path. Add each to "
-        f"CONNECTOR_BACKED_SUB_TYPES (a top-level LAMBDA catalog: plain athena:DeleteDataCatalog) or to "
-        f"FEDERATED_TEARDOWN_SUB_TYPES (the Lake-Formation-admin path), and check the delete handler."
+        f"DATABASE sub-type(s) {sorted(uncovered)} have no declared teardown disposition. Add each to "
+        f"CONNECTOR_BACKED_SUB_TYPES (a top-level LAMBDA catalog: plain athena:DeleteDataCatalog), to "
+        f"FEDERATED_TEARDOWN_SUB_TYPES (the Lake-Formation-admin path), or to "
+        f"NO_CATALOG_TEARDOWN_SUB_TYPES (nothing was provisioned), and check the delete handler."
     )
 
 
-def test_the_two_teardown_paths_do_not_overlap():
+def test_the_teardown_paths_do_not_overlap():
     """A sub-type in both would have its catalog deleted by athena:DeleteDataCatalog and
     then handed to a Lake-Formation-admin teardown that assumes a role scoped to the
-    deployment-wide ``{prefix}ds_*`` window."""
+    deployment-wide ``{prefix}ds_*`` window. One in a teardown path AND in the no-catalog
+    set is a contradiction: the set asserts there is nothing to act on."""
     assert not (CONNECTOR_BACKED_SUB_TYPES & FEDERATED_TEARDOWN_SUB_TYPES)
+    assert not (NO_CATALOG_TEARDOWN_SUB_TYPES & (CONNECTOR_BACKED_SUB_TYPES | FEDERATED_TEARDOWN_SUB_TYPES))
+
+
+def test_a_no_catalog_sub_type_claims_no_platform_catalog():
+    """It derives no catalog name, so a claim to release would never have been made."""
+    assert not (NO_CATALOG_TEARDOWN_SUB_TYPES & PLATFORM_CATALOG_CLAIM_SUB_TYPES)
+
+
+def test_trino_provisions_and_tears_down_nothing():
+    """Serve reaches a Trino source over its own coordinator, so create provisions no
+    Athena catalog and delete has nothing to release beyond the source row."""
+    assert SourceSubType.TRINO.value in NO_CATALOG_TEARDOWN_SUB_TYPES
 
 
 def test_every_connector_backed_sub_type_claims_a_platform_catalog():
