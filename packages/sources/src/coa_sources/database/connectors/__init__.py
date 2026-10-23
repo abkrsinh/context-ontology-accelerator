@@ -13,6 +13,7 @@ from .base import (
 from .custom_connector import CustomConnector
 from .glue_catalog import GlueCatalogConnector
 from .jdbc import JdbcConnector
+from .trino_source import TrinoConnector
 
 __all__ = [
     "ConnectionCheck",
@@ -21,6 +22,7 @@ __all__ = [
     "GlueCatalogConnector",
     "JdbcConnector",
     "MetadataConnector",
+    "TrinoConnector",
     "get_connector",
 ]
 
@@ -31,6 +33,7 @@ CONNECTOR_REGISTRY: dict[str, type[MetadataConnector]] = {
     # `CustomConnector` keys on the derived Athena catalog name and the database name
     # rather than on the sub-type, so it already discovers a Databricks source correctly.
     SourceSubType.DATABRICKS_SQL_WAREHOUSE: CustomConnector,
+    SourceSubType.TRINO: TrinoConnector,
 }
 
 

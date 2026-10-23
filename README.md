@@ -2,6 +2,27 @@
 
 An open-source semantic context layer for AWS that combines knowledge graphs, formal ontologies, and rule-based systems with modern AI — enabling agents to retrieve context, validate it against business logic, and determine correct actions.
 
+> **Branch `trino-source`: work in progress, based on `v0.3.7`.**
+>
+> Adds Trino as a data source (`SourceSubType.TRINO`), so a lakehouse reached through Trino (Iceberg REST, Hive metastore, Nessie, Delta) can be onboarded without mirroring into Glue or operating an Athena federation Lambda. Discovery reads the coordinator's `information_schema` in two queries per source; serve-time SQL executes on that same coordinator, so discovered identifiers are the queryable ones.
+>
+> **Landed so far**
+>
+> - [`models/src/main/smithy/unified-sources.smithy`](models/src/main/smithy/unified-sources.smithy) — `TrinoConfiguration` and `TrinoAuthMode`; `TRINO` added to `SourceSubType` and `QueryEngine`; a `trinoConfiguration` member on both `CreateDatabaseSourceInput` and `DatabaseSourceDetail`. Run `make generate` after pulling.
+> - [`connectors/trino_statement.py`](packages/sources/src/coa_sources/database/connectors/trino_statement.py) — `TrinoStatementRunner`: runs one statement to completion and returns every row, raising rather than returning a short answer. Deliberately shaped like its `athena_statement.py` sibling.
+> - [`connectors/trino_source.py`](packages/sources/src/coa_sources/database/connectors/trino_source.py) — `TrinoConnector`: discovery in **two** queries per source, no per-table fan-out. Resolves the schema's canonical spelling from `information_schema.schemata` first, because a mis-cased predicate makes Trino drop it and return zero rows with no error. Selects `comment` explicitly (a hidden column, absent from `SELECT *`), maps `is_nullable` to `Column.nullable` with `@notnull` still able to tighten it, and preserves `ordinal_position` order because composite primary keys depend on it.
+> - [`connectors/__init__.py`](packages/sources/src/coa_sources/database/connectors/__init__.py) — registry entry mapping `SourceSubType.TRINO` to `TrinoConnector`.
+> - [`pipeline/federation_handler.py`](packages/sources/src/coa_sources/database/pipeline/federation_handler.py) — explicit skip: nothing to provision and no Lake Formation grant to make.
+> - [`database/sub_types.py`](packages/sources/src/coa_sources/database/sub_types.py) — new `NO_CATALOG_TEARDOWN_SUB_TYPES`. A Trino source provisions no catalog, and both existing teardown paths would act on resources that never existed and report success.
+> - [`libs/common/.../constants.py`](libs/common/src/coa_common/constants.py), [`api/sources_handler.py`](packages/sources/src/coa_sources/api/sources_handler.py), [`coa_serve/clients/athena.py`](packages/context-manager/src/coa_serve/clients/athena.py) — the shared sub-type mirror, the config-blob map, and a serve log label. A new `SourceSubType` member has six forced registration sites; five are guarded by tripwire tests that fail the moment the member exists.
+> - Tests: [`test_trino_statement.py`](packages/sources/tests/unit/database/test_trino_statement.py) and [`test_trino_connector.py`](packages/sources/tests/unit/database/test_trino_connector.py).
+>
+> **Not yet wired:** source-create validation and the SSRF guard, the serve-side executor and composite routing, infra, and UI — so the sub-type is **not usable end to end** on this branch yet.
+>
+> `authMode` is `BASIC` or `JWT`. OAuth2 client-credentials and mTLS are kept out of scope currently.
+>
+> Trino's own fine-grained access control **does not apply** to queries from this service, which connects under one service identity. Scope the credential to exactly what the source should expose.
+
 ## Architecture
 
 The system follows a **Scan → Model → Serve** workflow:
