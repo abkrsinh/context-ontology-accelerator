@@ -140,6 +140,7 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.jdbc_configuration = None
     req.custom_connector_configuration = None
     req.databricks_sql_warehouse_configuration = None
+    req.trino_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -153,6 +154,7 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
     req.glue_configuration = None
     req.custom_connector_configuration = None
     req.databricks_sql_warehouse_configuration = None
+    req.trino_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -612,6 +614,7 @@ def _make_athena_db_req(
         "databaseName": database_name,
     }
     req.databricks_sql_warehouse_configuration = None
+    req.trino_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 

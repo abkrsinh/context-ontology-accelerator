@@ -36,6 +36,7 @@ from botocore.exceptions import ClientError
 from coa_common.dao import QueryParams
 from coa_common.domain_models import Table
 from coa_common.metadata_store import AssetResult, SMUSClient
+from coa_common.net import UrlGuardError, validate_url
 from coa_common.response import api_response, iso_to_epoch
 from coa_common.s3 import get_s3_client, read_file_bytes, upload_json
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
@@ -154,6 +155,7 @@ _CONFIG_MEMBERS = (
     "jdbcConfiguration",
     "customConnectorConfiguration",
     "databricksSqlWarehouseConfiguration",
+    "trinoConfiguration",
 )
 
 
@@ -267,6 +269,49 @@ def _validate_credential_secret_binding(jdbc_config: Any, namespace_id: str) -> 
     if verdict.ok:
         return None
     return api_response(503 if verdict.retryable else 400, {"error": verdict.message})
+
+
+# Hosts whose non-public addresses a Trino `uri` may resolve to, from CDK context.
+# Empty means no Trino source is creatable: a coordinator is plausibly on a private
+# address, and the allowlist is the only thing that distinguishes the operator's
+# in-VPC cluster from an arbitrary internal host. Fail-closed by design.
+_TRINO_ALLOWED_HOSTS: tuple[str, ...] = tuple(
+    h.strip() for h in os.environ.get("TRINO_ALLOWED_HOSTS", "").split(",") if h.strip()
+)
+
+
+def _validate_trino_configuration(trino_config: Any, namespace_id: str) -> dict[str, Any] | None:
+    """Everything a Trino source can be refused for, decided before the record exists.
+
+    Two checks, and deliberately not a third:
+
+    * The credential secret must carry the ``<prefix>:namespace`` tag listing this
+      namespace — the same proof JDBC requires, via the same helper.
+    * ``uri`` must pass the shared SSRF guard. It is caller-supplied and fetched
+      server-side from a private subnet, so without this, source creation is an
+      internal port scanner. Re-validated on every scan too, since an allowlisted
+      hostname can later resolve elsewhere.
+
+    The secret's SHAPE is not checked here: that needs its contents, and reading
+    them would require a ``GetSecretValue`` grant on this path for no gain. The
+    runner validates the shape at connect and names the mismatch.
+
+    Returns an error response, or ``None`` when the source may be created.
+    """
+    if trino_config is None:
+        return None
+    verdict = check_secret_namespace_binding(getattr(trino_config, "credential_secret_arn", None), namespace_id)
+    if not verdict.ok:
+        return api_response(503 if verdict.retryable else 400, {"error": verdict.message})
+    try:
+        validate_url(
+            getattr(trino_config, "uri", "") or "",
+            allowed_hosts=_TRINO_ALLOWED_HOSTS,
+            field_name="trinoConfiguration.uri",
+        )
+    except UrlGuardError as exc:
+        return api_response(400, {"error": str(exc)})
+    return None
 
 
 # Fields a JDBC source cannot re-point after creation. Each one decides which
@@ -529,7 +574,7 @@ def _validate_databricks_configuration(
     )
 
 
-def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
+def _resolve_query_engine(glue_config: Any, jdbc_config: Any, trino_config: Any = None) -> QueryEngine:
     """Preferred single-source execution engine for the source.
 
     ``JDBC`` (direct, low-latency) only when a direct dialect is implemented for
@@ -545,7 +590,12 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     which is correct and the only option: there is no direct adapter for either, and
     serve's own gate (``_fetch_jdbc_source`` requires ``queryEngine == "JDBC"``) keeps
     them off the direct route without a route-selection change.
+
+    ``TRINO`` is unconditional — Athena cannot reach a Trino-only table, so there is
+    no fallback engine to choose between.
     """
+    if trino_config is not None:
+        return QueryEngine.TRINO
     if jdbc_config is not None:
         engine = getattr(jdbc_config.engine, "value", jdbc_config.engine) or ""
         if str(engine).upper() in DIRECT_QUERY_ENGINES:
@@ -696,7 +746,10 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
     jdbc_config = db_req.jdbc_configuration
     custom_connector_config = db_req.custom_connector_configuration
     databricks_config = db_req.databricks_sql_warehouse_configuration
-    supplied = [c for c in (glue_config, jdbc_config, custom_connector_config, databricks_config) if c is not None]
+    trino_config = db_req.trino_configuration
+    supplied = [
+        c for c in (glue_config, jdbc_config, custom_connector_config, databricks_config, trino_config) if c is not None
+    ]
     if not supplied:
         return api_response(
             400,
@@ -778,6 +831,8 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
         sub_type = SourceSubType.CUSTOM_CONNECTOR
     elif databricks_config:
         sub_type = SourceSubType.DATABRICKS_SQL_WAREHOUSE
+    elif trino_config:
+        sub_type = SourceSubType.TRINO
     else:
         sub_type = SourceSubType.GLUE_DATABASE
     source_id = str(uuid.uuid4())
@@ -790,6 +845,11 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
         error, databricks_validated = _validate_databricks_configuration(databricks_config, namespace_id, source_id)
         if error:
             return error
+
+    # Same posture for a Trino source: refused here, before the record exists.
+    trino_error = _validate_trino_configuration(trino_config, namespace_id)
+    if trino_error:
+        return trino_error
 
     config_dict = _strip_external_id(supplied[0].to_dict())
 
@@ -808,6 +868,15 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
         config_dict["databaseName"] = databricks_schema
         config_dict["crossAccountRoleArn"] = databricks_validated.role_arn
         config_dict["credentialSecretArn"] = databricks_validated.secret_arn
+
+    # Trino's SPI lowercases every identifier it reports, so a `ORDERS` filter would
+    # match nothing silently. Normalised in the blob, not at read, so the stored
+    # record is what actually runs.
+    if trino_config is not None:
+        for member in ("catalog", "schemaName", "tableFilter", "tableExcludeFilter"):
+            value = config_dict.get(member)
+            if value:
+                config_dict[member] = value.lower()
 
     # We derive the Athena data-catalog name rather than letting the caller name
     # it: catalog names are account+region-global, so a caller-chosen name would
@@ -854,7 +923,7 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
         # direct dialect exists for the engine (PostgreSQL, Redshift, MySQL, and
         # SQL Server today — connectors/jdbc.py:DIRECT_QUERY_ENGINES), otherwise
         # Athena.
-        "queryEngine": _resolve_query_engine(glue_config, jdbc_config),
+        "queryEngine": _resolve_query_engine(glue_config, jdbc_config, trino_config),
         "region": (glue_config.region if glue_config else _AWS_REGION),
         "queryable": False,
         "tablesDiscovered": 0,

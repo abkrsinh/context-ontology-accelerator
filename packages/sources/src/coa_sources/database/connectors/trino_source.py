@@ -48,7 +48,7 @@ from coa_sources.database.metrics import emit_metric
 
 from .base import ConnectionCheck, ConnectionTestResult
 from .constraint_tags import ParsedComment, assemble_constraints, parse_comment
-from .filters import compile_filter
+from .filters import compile_filter, unmatched_regex_warning
 from .trino_statement import (
     TrinoConfigError,
     TrinoStatementError,
@@ -236,10 +236,17 @@ class TrinoConnector:
         include = compile_filter(config.get("table_filter"), "table_filter")
         exclude = compile_filter(config.get("table_exclude_filter"), "table_exclude_filter")
 
-        listed = [
-            row[0]
-            for row in runner.run(_TABLES_SQL, catalog=catalog, params=(resolved,))
-            if row and row[0] and self._is_included(row[0], include, exclude)
+        all_names = [row[0] for row in runner.run(_TABLES_SQL, catalog=catalog, params=(resolved,)) if row and row[0]]
+        listed = [name for name in all_names if self._is_included(name, include, exclude)]
+        # Silent for a glob that legitimately matches nothing, so it does not cover a
+        # mis-cased filter — registration lowercases those.
+        filter_warnings = [
+            w
+            for w in (
+                unmatched_regex_warning(config.get("table_filter"), "table_filter", all_names),
+                unmatched_regex_warning(config.get("table_exclude_filter"), "table_exclude_filter", all_names),
+            )
+            if w
         ]
         column_rows = runner.run(_COLUMNS_SQL, catalog=catalog, params=(resolved,))
 
@@ -269,7 +276,7 @@ class TrinoConnector:
             tables=len(tables),
             failed=len(failed),
         )
-        return DiscoveredMetadata(tables=tables, failed_tables=sorted(failed))
+        return DiscoveredMetadata(tables=tables, failed_tables=sorted(failed), filter_warnings=filter_warnings)
 
     # ── Internals ────────────────────────────────────────────────────────────
 

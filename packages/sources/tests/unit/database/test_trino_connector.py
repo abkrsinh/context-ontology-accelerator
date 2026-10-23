@@ -493,3 +493,30 @@ def test_connection_reports_a_config_error_before_any_network_call() -> None:
     assert result.success is False
     assert [c.check for c in result.checks] == ["auth"]
     assert "token" in result.message
+
+
+def test_regex_shaped_filter_that_matched_nothing_is_warned_about() -> None:
+    """Mirrors every sibling connector: a filter with no effect reaches the scan job."""
+    runner = FakeRunner(tables=[["orders"]], columns=[_col("orders", "id")])
+    result = _connector(runner).discover_metadata(dict(_CONFIG, table_filter="^(staging|tmp)$"))
+    assert len(result.filter_warnings) == 1
+    assert "table_filter" in result.filter_warnings[0]
+
+
+def test_both_filters_can_warn_independently() -> None:
+    runner = FakeRunner(tables=[["orders"]], columns=[_col("orders", "id")])
+    config = dict(_CONFIG, table_filter="^orders$", table_exclude_filter="^tmp$")
+    result = _connector(runner).discover_metadata(config)
+    assert len(result.filter_warnings) == 2
+
+
+def test_a_glob_that_legitimately_matches_nothing_stays_silent() -> None:
+    """An exclude for a table that does not exist yet is not a mistake."""
+    runner = FakeRunner(tables=[["orders"]], columns=[_col("orders", "id")])
+    result = _connector(runner).discover_metadata(dict(_CONFIG, table_exclude_filter="staging_*"))
+    assert result.filter_warnings == []
+
+
+def test_no_filters_means_no_warnings() -> None:
+    runner = FakeRunner(tables=[["orders"]], columns=[_col("orders", "id")])
+    assert _connector(runner).discover_metadata(dict(_CONFIG)).filter_warnings == []
