@@ -14,3 +14,5 @@ snowflake-connector-python>=4.8.0  # Snowflake (needs a warehouse in config; hea
 # 2026.10.19 is the first certifi bundle without the roots behind the compromised
 # emSign intermediates. botocore also uses certifi's bundle over its own when installed.
 certifi>=2026.10.19
+# Trino client for the TRINO sub-type's information_schema reads.
+trino>=0.330.0

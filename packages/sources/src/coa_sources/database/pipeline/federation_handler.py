@@ -362,6 +362,12 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     # Trino enforces its own authorization. Discovery having succeeded is the evidence
     # for queryable, exactly as it is for the connector-backed arm above.
     if sub_type == SourceSubType.TRINO:
+        # Serve reads this secret at query time through the secret's own resource
+        # policy; the runtime's identity policy deliberately excludes tagged
+        # secrets. Without this a Tier-2 query fails AccessDenied on GetSecretValue.
+        trino_secret = json.loads(item.get("configuration") or "{}").get("credentialSecretArn", "")
+        if trino_secret:
+            _grant_secret_read_to_consumer(trino_secret, namespace_id)
         _get_dao().update(
             key=source_key,
             update_fields={"queryable": True},

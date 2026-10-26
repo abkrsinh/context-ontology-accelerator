@@ -229,12 +229,28 @@ async def _ensure_initialized():
             except Exception as exc:
                 logger.warning("redshift_executor_unavailable", error=type(exc).__name__)
 
+        # Off unless TRINO_ENABLED; unwired, TRINO sources fall through to Athena,
+        # which for a Trino-only table fails cleanly rather than answering wrongly.
+        trino_executor = None
+        if os.environ.get("TRINO_ENABLED", "").lower() == "true" and config.data_sources_table:
+            try:
+                from .clients.trino import TrinoQueryExecutor
+
+                trino_executor = TrinoQueryExecutor(
+                    sources_registry=sources_registry,
+                    region=config.bedrock_region,
+                )
+                logger.info("trino_dispatch_enabled")
+            except Exception as exc:
+                logger.warning("trino_executor_unavailable", error=type(exc).__name__)
+
         query_executor = CompositeQueryExecutor(
             athena_executor=athena_executor,
             source_db_executor=source_db_executor,
             firewall=SQLFirewall(),
             sources_registry=sources_registry,
             redshift_executor=redshift_executor,
+            trino_executor=trino_executor,
         )
 
         # Build tier resolvers

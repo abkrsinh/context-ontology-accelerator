@@ -48,6 +48,7 @@ import {
   OntologyStack,
   ServeStack,
   SourcesStack,
+  TrinoTestStack,
   VkgStack,
 } from "../lib/stacks/services";
 
@@ -548,6 +549,50 @@ async function deploy(): Promise<void> {
     agentCoreAzNames,
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
+
+  // Opt-in test infrastructure for the TRINO source type: nothing is created
+  // unless every value is supplied, and no COA stack depends on it.
+  const trinoTestEnabled =
+    app.node.tryGetContext("trino_test_enabled") === "true" ||
+    app.node.tryGetContext("trino_test_enabled") === true;
+  if (trinoTestEnabled) {
+    const required = {
+      certificateArn: app.node.tryGetContext("trino_test_cert_arn"),
+      tableBucketArn: app.node.tryGetContext("trino_test_table_bucket_arn"),
+      hostname: app.node.tryGetContext("trino_test_hostname"),
+      hostedZoneId: app.node.tryGetContext("trino_test_zone_id"),
+      hostedZoneName: app.node.tryGetContext("trino_test_zone_name"),
+    };
+    const missing = Object.entries(required)
+      .filter(([, v]) => !v)
+      .map(([k]) => k);
+    if (missing.length) {
+      throw new Error(
+        `trino_test_enabled requires context: ${missing.join(", ")}`,
+      );
+    }
+    const trinoTest = new TrinoTestStack(app, `${stackPrefix}-trino-test`, {
+      network,
+      certificateArn: required.certificateArn as string,
+      tableBucketArn: required.tableBucketArn as string,
+      hostname: required.hostname as string,
+      hostedZoneId: required.hostedZoneId as string,
+      hostedZoneName: required.hostedZoneName as string,
+      instanceAvailabilityZone:
+        (app.node.tryGetContext("trino_test_az") as string) ?? "us-east-1c",
+      extraClientSecurityGroupIds: String(
+        app.node.tryGetContext("trino_test_client_sg_ids") ?? "",
+      )
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean),
+      namespaceId: app.node.tryGetContext("trino_test_namespace_id") as
+        | string
+        | undefined,
+    });
+    trinoTest.addDependency(network);
+  }
+
   mcp.addDependency(auth); // needs /issuer, /userpool-client-id, /mcp-client-id SSM params
 
   // Every stack with a VPC Lambda waits for EniWarmStack, so its functions reuse

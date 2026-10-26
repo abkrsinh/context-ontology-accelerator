@@ -503,6 +503,22 @@ export class ServeStack extends SCLStack {
           REDSHIFT_SERVE_DATABASE:
             (this.node.tryGetContext("redshift_serve_database") as string) ??
             "dev",
+          // Off by default: unwired, TRINO sources fall through to Athena, which
+          // cannot reach a Trino-only table — a clean failure, not wrong data.
+          TRINO_ENABLED: String(
+            this.node.tryGetContext("trino_source_enabled") === "true" ||
+              this.node.tryGetContext("trino_source_enabled") === true,
+          ),
+          // Same fail-closed allowlist the control plane validates against; the
+          // executor re-guards the stored URI on every query.
+          TRINO_ALLOWED_HOSTS: (() => {
+            const hosts =
+              (this.node.tryGetContext("trino_allowed_hosts") as
+                | string[]
+                | string
+                | undefined) ?? [];
+            return Array.isArray(hosts) ? hosts.join(",") : String(hosts);
+          })(),
           OSS_ONTOLOGY_INDEX: opensearchCollectionName,
           // Default engine for a request that does not set `options.mode`. Standard
           // (not deep reasoning), because deep reasoning runs ~90s at p50 and the

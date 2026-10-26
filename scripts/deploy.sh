@@ -49,6 +49,8 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_SMUS_ADMIN_ARNS:-}" ] && CONTEXT="$CONTEXT --context smus_admin_principal_arns=$SCL_SMUS_ADMIN_ARNS"
 # Comma-separated. Unset means no TRINO source is creatable or scannable.
 [ -n "${SCL_TRINO_ALLOWED_HOSTS:-}" ] && CONTEXT="$CONTEXT --context trino_allowed_hosts=$SCL_TRINO_ALLOWED_HOSTS"
+# Gates construction of the serve-side Trino executor; unset leaves TRINO sources on Athena.
+[ -n "${SCL_TRINO_SOURCE_ENABLED:-}" ] && CONTEXT="$CONTEXT --context trino_source_enabled=$SCL_TRINO_SOURCE_ENABLED"
 # Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
 [ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT="$CONTEXT --context oops_endpoint=$SCL_OOPS_ENDPOINT"
 

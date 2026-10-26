@@ -899,6 +899,7 @@ dependencies = [
     { name = "sqlglot" },
     { name = "strands-agents" },
     { name = "structlog" },
+    { name = "trino" },
     { name = "uvicorn" },
 ]
 
@@ -928,6 +929,7 @@ requires-dist = [
     { name = "sqlglot", specifier = ">=25.0" },
     { name = "strands-agents", specifier = ">=1.19.0" },
     { name = "structlog", specifier = ">=24.0" },
+    { name = "trino", specifier = ">=0.330.0" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 

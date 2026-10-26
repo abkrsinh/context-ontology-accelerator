@@ -60,6 +60,7 @@ class CompositeQueryExecutor:
         firewall: SQLFirewall | None = None,
         sources_registry=None,
         redshift_executor: QueryExecutor | None = None,
+        trino_executor: QueryExecutor | None = None,
     ):
         """Wire the Athena and optional JDBC executors and the routing helpers.
 
@@ -73,6 +74,9 @@ class CompositeQueryExecutor:
             redshift_executor: Optional Redshift Serverless executor for Glue/Iceberg
                 sources that opt into ``queryEngine=REDSHIFT``. When
                 ``None``, such sources fall through to Athena.
+            trino_executor: Optional Trino executor for ``queryEngine=TRINO``
+                sources. When ``None`` they fall through to Athena, which cannot
+                reach a Trino-only table — a clean failure rather than wrong data.
         """
         self._athena = athena_executor
         self._source_db = source_db_executor
@@ -89,6 +93,7 @@ class CompositeQueryExecutor:
         # sources fall through to Athena — i.e. the deployed Athena-only behaviour
         # is never regressed; this only ADDS the Redshift path when wired.
         self._redshift = redshift_executor
+        self._trino = trino_executor
 
     async def execute(
         self,
@@ -257,6 +262,20 @@ class CompositeQueryExecutor:
                     sql,
                     namespace=namespace,
                     data_source_id=redshift_source_id,
+                    params=params,
+                    max_rows=max_rows,
+                    timeout_seconds=timeout_seconds,
+                )
+        # Trino is addressed per source, so no catalog analysis applies: a Trino
+        # source's tables exist only on its own coordinator.
+        if self._trino is not None:
+            trino_source_id = await self._resolve_trino_source(namespace, data_source_id)
+            if trino_source_id:
+                logger.info("composite_dispatch", route="trino", data_source_id=trino_source_id)
+                return await self._trino.execute(
+                    sql,
+                    namespace=namespace,
+                    data_source_id=trino_source_id,
                     params=params,
                     max_rows=max_rows,
                     timeout_seconds=timeout_seconds,
@@ -466,6 +485,29 @@ class CompositeQueryExecutor:
         """
         return str(source.get("queryEngine", "")).upper() == "REDSHIFT" and source.get("queryable") is True
 
+    @staticmethod
+    def _is_trino_routed(source: dict[str, Any]) -> bool:
+        """``queryEngine=TRINO`` plus ``queryable`` — mirrors ``_is_redshift_routed``."""
+        return str(source.get("queryEngine", "")).upper() == "TRINO" and source.get("queryable") is True
+
+    async def _resolve_trino_source(self, namespace: str, data_source_id: str) -> str:
+        """Resolve a Trino-execution source id, or "" to fall through to Athena.
+
+        Requires an explicit id: unlike Redshift there is no sole-source fallback,
+        because each Trino source names its own coordinator and guessing would send
+        a query to the wrong cluster.
+        """
+        if not self._sources or not data_source_id:
+            return ""
+        try:
+            source = await self._sources.get_source(namespace, data_source_id)
+        except Exception:
+            logger.warning("composite_trino_lookup_failed", namespace=namespace)
+            return ""
+        if not source or not self._is_trino_routed(source):
+            return ""
+        return str(data_source_id)
+
     async def _resolve_redshift_source(self, namespace: str, data_source_id: str) -> str:
         """Resolve a Redshift-execution source id, or "" if none applies.
 
@@ -617,11 +659,13 @@ class CompositeQueryExecutor:
             health["source_db"] = await self._source_db.health_check()
         if self._redshift is not None:
             health["redshift"] = await self._redshift.health_check()
+        if self._trino is not None:
+            health["trino"] = await self._trino.health_check()
         return health
 
     async def close(self) -> None:
         """Close both wrapped executors, logging (not raising) any close errors."""
-        for executor in (self._athena, self._source_db, self._redshift):
+        for executor in (self._athena, self._source_db, self._redshift, self._trino):
             close_fn = getattr(executor, "close", None)
             if close_fn and callable(close_fn):
                 try:

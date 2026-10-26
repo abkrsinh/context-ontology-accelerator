@@ -624,7 +624,14 @@ def _discover(
     """
     item = source_item or {}
     connector_config = {
-        "database_name": config["databaseName"],
+        # TRINO names its one-schema-per-source field `schemaName`; every other
+        # sub-type uses `databaseName`.
+        "database_name": config.get("databaseName") or config.get("schemaName", ""),
+        # TRINO-only; ignored by the other connectors.
+        "uri": config.get("uri", ""),
+        "catalog": config.get("catalog", ""),
+        "schema_name": config.get("schemaName", ""),
+        "auth_mode": config.get("authMode", ""),
         # Custom-connector (CUSTOM_CONNECTOR) sources only. Read from the source
         # record, not from `config`: the name is derived by the control plane and
         # stored as a top-level attribute, so it is not in the configuration blob

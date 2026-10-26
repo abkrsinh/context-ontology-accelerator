@@ -11,4 +11,5 @@ export { NamespaceStack } from "./namespace-stack";
 export { OntologyStack } from "./ontology-stack";
 export { ServeStack } from "./serve-stack";
 export { SourcesStack } from "./sources-stack";
+export { TrinoTestStack } from "./trino-test-stack";
 export { VkgStack } from "./vkg-stack";

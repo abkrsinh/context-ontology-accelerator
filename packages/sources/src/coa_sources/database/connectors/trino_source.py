@@ -34,7 +34,10 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+import boto3
 import structlog
+from botocore.exceptions import ClientError
+from coa_common import resolve_region
 from coa_common.domain_models import (
     BusinessMetadata,
     Column,
@@ -129,6 +132,29 @@ def _allowed_hosts() -> tuple[str, ...]:
     return tuple(h.strip() for h in os.environ.get("TRINO_ALLOWED_HOSTS", "").split(",") if h.strip())
 
 
+def _fetch_secret(secret_arn: str, region: str) -> dict:
+    """Read the credential secret, as JdbcConnector does for its own.
+
+    Fetched by the connector rather than handed down by the pipeline so the
+    credential never sits in the config dict that gets logged on failure.
+    """
+    if not secret_arn:
+        raise TrinoConfigError("trinoConfiguration.credentialSecretArn is required")
+    client = boto3.client("secretsmanager", region_name=region)
+    try:
+        response = client.get_secret_value(SecretId=secret_arn)
+    except ClientError as exc:
+        code = exc.response["Error"]["Code"]
+        if code == "ResourceNotFoundException":
+            raise TrinoConfigError("Trino credential secret not found") from exc
+        if code == "AccessDeniedException":
+            raise TrinoConfigError("Access denied to the Trino credential secret") from exc
+        raise
+    if "SecretString" not in response:
+        raise TrinoConfigError("Trino credential secret must be a string, not binary")
+    return json.loads(response["SecretString"])
+
+
 def _default_runner_factory(config: dict) -> TrinoStatementRunner:
     """Build a runner from a source's stored configuration.
 
@@ -141,10 +167,13 @@ def _default_runner_factory(config: dict) -> TrinoStatementRunner:
         validate_url(uri, allowed_hosts=_allowed_hosts(), field_name="trinoConfiguration.uri")
     except UrlGuardError as exc:
         raise TrinoConfigError(str(exc)) from exc
+    secret = config.get("secret") or _fetch_secret(
+        config.get("credential_secret_arn", ""), config.get("region") or resolve_region()
+    )
     return TrinoStatementRunner(
         uri=uri,
         auth_mode=config.get("auth_mode", ""),
-        secret=config.get("secret") or {},
+        secret=secret,
     )
 
 
