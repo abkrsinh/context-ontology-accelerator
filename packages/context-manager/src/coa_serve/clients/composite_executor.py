@@ -27,6 +27,7 @@ the caller (Tier-1 orchestrator / Tier-2 VKGTranslator) before dispatch.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import sqlglot
@@ -269,8 +270,19 @@ class CompositeQueryExecutor:
         # Trino is addressed per source, so no catalog analysis applies: a Trino
         # source's tables exist only on its own coordinator.
         if self._trino is not None:
-            trino_source_id = await self._resolve_trino_source(namespace, data_source_id)
+            trino_source_id, trino_catalog, trino_schema = await self._resolve_trino_source(namespace, data_source_id)
             if trino_source_id:
+                # The statement reaches the coordinator verbatim and the session
+                # catalog/schema are defaults, not constraints, so a qualified
+                # reference could otherwise read outside the namespace under the
+                # source's single service identity.
+                await self._authorize_qualified_references(
+                    sql,
+                    namespace,
+                    frozenset({trino_schema.lower()} if trino_schema else set()),
+                    default_catalog=trino_catalog,
+                    route="trino",
+                )
                 logger.info("composite_dispatch", route="trino", data_source_id=trino_source_id)
                 return await self._trino.execute(
                     sql,
@@ -298,6 +310,8 @@ class CompositeQueryExecutor:
         sql: str,
         namespace: str,
         selected_source_schemas: frozenset[str],
+        default_catalog: str = "awsdatacatalog",
+        route: str = "jdbc_direct",
     ) -> None:
         """Deny qualified references outside ``namespace`` before the JDBC route runs.
 
@@ -322,7 +336,7 @@ class CompositeQueryExecutor:
                 sql,
                 native_databases=scope.native_databases,
                 federated_catalog_schemas=scope.federated_catalog_schemas,
-                default_catalog="awsdatacatalog",
+                default_catalog=default_catalog,
                 # The direct-JDBC connection supplies the catalog, so a bare
                 # "schema.table" is authorized only when that schema belongs to
                 # the selected source whose credentials will execute the query.
@@ -333,7 +347,7 @@ class CompositeQueryExecutor:
         except NamespaceSQLScopeError as exc:
             logger.warning(
                 "namespace_scope_denied",
-                route="jdbc_direct",
+                route=route,
                 namespace=namespace,
                 reason=str(exc),
                 native_databases=sorted(scope.native_databases),
@@ -490,23 +504,34 @@ class CompositeQueryExecutor:
         """``queryEngine=TRINO`` plus ``queryable`` — mirrors ``_is_redshift_routed``."""
         return str(source.get("queryEngine", "")).upper() == "TRINO" and source.get("queryable") is True
 
-    async def _resolve_trino_source(self, namespace: str, data_source_id: str) -> str:
-        """Resolve a Trino-execution source id, or "" to fall through to Athena.
+    async def _resolve_trino_source(self, namespace: str, data_source_id: str) -> tuple[str, str, str]:
+        """Resolve ``(source_id, catalog, schema)``, or empties to fall through to Athena.
+
+        Catalog and schema come back too because the Trino route authorizes against
+        them: they are the session defaults, so they are what a bare reference
+        resolves to.
 
         Requires an explicit id: unlike Redshift there is no sole-source fallback,
         because each Trino source names its own coordinator and guessing would send
         a query to the wrong cluster.
         """
+        empty = ("", "", "")
         if not self._sources or not data_source_id:
-            return ""
+            return empty
         try:
             source = await self._sources.get_source(namespace, data_source_id)
         except Exception:
             logger.warning("composite_trino_lookup_failed", namespace=namespace)
-            return ""
+            return empty
         if not source or not self._is_trino_routed(source):
-            return ""
-        return str(data_source_id)
+            return empty
+        raw = source.get("configuration") or "{}"
+        try:
+            config = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            logger.warning("composite_trino_config_unreadable", namespace=namespace)
+            return empty
+        return str(data_source_id), str(config.get("catalog", "")), str(config.get("schemaName", ""))
 
     async def _resolve_redshift_source(self, namespace: str, data_source_id: str) -> str:
         """Resolve a Redshift-execution source id, or "" if none applies.

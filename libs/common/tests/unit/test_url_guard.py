@@ -94,8 +94,8 @@ def test_the_error_never_echoes_the_resolved_address() -> None:
 def test_public_address_passes_in_global_mode() -> None:
     with _resolves_to("93.184.216.34"):
         result = validate_url("https://example.com", require_global=True)
-    assert result.pinned_url == "https://93.184.216.34:443"
     assert result.hostname == "example.com"
+    assert result.port == 443
 
 
 @pytest.mark.parametrize("address", ["10.0.0.5", "192.168.1.1", "172.16.0.1", "100.64.0.1"])
@@ -116,8 +116,7 @@ def test_private_address_rejected_when_not_allowlisted() -> None:
 def test_private_address_allowed_when_host_allowlisted() -> None:
     """The in-VPC Trino coordinator — the topology this mode exists for."""
     with _resolves_to("10.0.0.5"):
-        result = validate_url("https://trino.corp.com", allowed_hosts=["trino.corp.com"])
-    assert result.pinned_url == "https://10.0.0.5:443"
+        assert validate_url("https://trino.corp.com", allowed_hosts=["trino.corp.com"]).hostname == "trino.corp.com"
 
 
 def test_cgnat_needs_the_allowlist_too() -> None:
@@ -172,21 +171,12 @@ def test_rejects_when_the_denied_address_comes_first() -> None:
         validate_url("https://example.com", require_global=True)
 
 
-def test_resolution_happens_once_and_the_result_is_pinned() -> None:
-    """The anti-rebinding property: one lookup, and the caller fetches the IP."""
+def test_resolution_happens_once() -> None:
+    """Every address is checked from a single lookup, so a split answer cannot be
+    evaluated twice with different results."""
     with _resolves_to("93.184.216.34") as getaddrinfo:
-        result = validate_url("https://example.com", require_global=True)
+        validate_url("https://example.com", require_global=True)
     assert getaddrinfo.call_count == 1
-    assert "93.184.216.34" in result.pinned_url
-    assert "example.com" not in result.pinned_url
-
-
-def test_a_later_rebind_cannot_be_reached() -> None:
-    """Whatever DNS says afterwards, the pinned URL still names the checked IP."""
-    with _resolves_to("93.184.216.34"):
-        result = validate_url("https://example.com", require_global=True)
-    with _resolves_to("169.254.169.254"):
-        assert result.pinned_url == "https://93.184.216.34:443"
 
 
 # ── Resolution failures ──────────────────────────────────────────────────────
@@ -222,9 +212,7 @@ def test_empty_resolution_is_refused() -> None:
 
 def test_explicit_port_is_preserved() -> None:
     with _resolves_to("93.184.216.34"):
-        result = validate_url("https://example.com:8443", require_global=True)
-    assert result.pinned_url == "https://93.184.216.34:8443"
-    assert result.port == 8443
+        assert validate_url("https://example.com:8443", require_global=True).port == 8443
 
 
 def test_port_defaults_to_443() -> None:
@@ -232,11 +220,9 @@ def test_port_defaults_to_443() -> None:
         assert validate_url("https://example.com", require_global=True).port == 443
 
 
-def test_ipv6_is_bracketed_in_the_pinned_url() -> None:
-    """Unbracketed, the address's colons would be parsed as a port."""
+def test_an_ipv6_only_host_is_accepted() -> None:
     with _resolves_to("2606:2800:220:1:248:1893:25c8:1946"):
-        result = validate_url("https://example.com", require_global=True)
-    assert result.pinned_url == "https://[2606:2800:220:1:248:1893:25c8:1946]:443"
+        assert validate_url("https://example.com", require_global=True).hostname == "example.com"
 
 
 def test_field_name_appears_in_the_error() -> None:

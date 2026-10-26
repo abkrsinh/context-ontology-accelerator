@@ -15,9 +15,14 @@ An open-source semantic context layer for AWS that combines knowledge graphs, fo
 > - [`pipeline/federation_handler.py`](packages/sources/src/coa_sources/database/pipeline/federation_handler.py) — explicit skip: nothing to provision and no Lake Formation grant to make.
 > - [`database/sub_types.py`](packages/sources/src/coa_sources/database/sub_types.py) — new `NO_CATALOG_TEARDOWN_SUB_TYPES`. A Trino source provisions no catalog, and both existing teardown paths would act on resources that never existed and report success.
 > - [`libs/common/.../constants.py`](libs/common/src/coa_common/constants.py), [`api/sources_handler.py`](packages/sources/src/coa_sources/api/sources_handler.py), [`coa_serve/clients/athena.py`](packages/context-manager/src/coa_serve/clients/athena.py) — the shared sub-type mirror, the config-blob map, and a serve log label. A new `SourceSubType` member has six forced registration sites; five are guarded by tripwire tests that fail the moment the member exists.
-> - Tests: [`test_trino_statement.py`](packages/sources/tests/unit/database/test_trino_statement.py) and [`test_trino_connector.py`](packages/sources/tests/unit/database/test_trino_connector.py).
+> - [`libs/common/.../net/url_guard.py`](libs/common/src/coa_common/net/url_guard.py) — SSRF guard for the caller-supplied coordinator URI, re-checked on every scan and query.
+> - [`coa_serve/clients/trino.py`](packages/context-manager/src/coa_serve/clients/trino.py) and [`composite_executor.py`](packages/context-manager/src/coa_serve/clients/composite_executor.py) — serve-time executor, `queryEngine=TRINO` routing, namespace-scope authorization, and a per-namespace circuit breaker.
+> - [`infra/.../trino-test-stack.ts`](infra/lib/stacks/services/trino-test-stack.ts) — opt-in single-node Trino over an S3 Tables Iceberg REST catalog, for exercising the path end to end.
+> - Tests: [`test_trino_statement.py`](packages/sources/tests/unit/database/test_trino_statement.py), [`test_trino_connector.py`](packages/sources/tests/unit/database/test_trino_connector.py), [`test_trino_registration.py`](packages/sources/tests/unit/api/test_trino_registration.py), [`test_url_guard.py`](libs/common/tests/unit/test_url_guard.py), [`test_trino_executor.py`](packages/context-manager/tests/unit/test_trino_executor.py).
 >
-> **Not yet wired:** source-create validation and the SSRF guard, the serve-side executor and composite routing, infra, and UI — so the sub-type is **not usable end to end** on this branch yet.
+> Verified against that stack: scan → review → approve → induce → accept → Tier-2 query, with the composite logging `route=trino` and the executor running SQL on the live coordinator.
+>
+> **Not yet done:** the Connect Source UI, so the sub-type is **API-only** — and integration tests.
 >
 > `authMode` is `BASIC` or `JWT`. OAuth2 client-credentials and mTLS are kept out of scope currently.
 >

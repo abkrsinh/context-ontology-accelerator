@@ -365,8 +365,13 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         # Serve reads this secret at query time through the secret's own resource
         # policy; the runtime's identity policy deliberately excludes tagged
         # secrets. Without this a Tier-2 query fails AccessDenied on GetSecretValue.
-        trino_secret = json.loads(item.get("configuration") or "{}").get("credentialSecretArn", "")
+        raw_config = item.get("configuration") or "{}"
+        trino_config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+        trino_secret = trino_config.get("credentialSecretArn", "")
         if trino_secret:
+            # The grant below rewrites this secret's policy, so refuse a tag list
+            # that changed mid-scan rather than modify a secret we no longer own.
+            require_secret_namespace_binding(trino_secret, namespace_id, datasource_id)
             _grant_secret_read_to_consumer(trino_secret, namespace_id)
         _get_dao().update(
             key=source_key,

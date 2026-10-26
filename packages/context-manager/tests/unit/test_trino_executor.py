@@ -341,3 +341,145 @@ async def test_health_and_close_include_trino() -> None:
     assert health["trino"]["backend"] == "trino"
     await composite.close()
     trino.close.assert_awaited_once()
+
+
+# ── namespace-scope authorization on the Trino route ─────────────────────
+
+
+def _scoped_registry(*databases: str, catalog_schemas: set | None = None):
+    """A Trino-routed registry whose namespace scope authorizes ``databases``.
+
+    ``catalog_schemas`` mirrors what the real ``sql_namespace_scope`` now returns
+    for a TRINO row — the ``(catalog, schema)`` pair that authorizes a 3-part name.
+    """
+    from coa_serve.clients.sources_registry import SQLNamespaceScope
+
+    reg = _registry(
+        {
+            "queryEngine": "TRINO",
+            "queryable": True,
+            "configuration": json.dumps({**_CONFIG, "catalog": "iceberg", "schemaName": "sales"}),
+        }
+    )
+    reg.sql_namespace_scope = AsyncMock(
+        return_value=SQLNamespaceScope(
+            native_databases=frozenset(databases),
+            federated_catalog_schemas=frozenset(catalog_schemas or set()),
+        )
+    )
+    return reg
+
+
+async def test_the_trino_route_consults_the_namespace_scope() -> None:
+    """Mirrors the JDBC/Athena/Redshift routes: Trino was the only one without it."""
+    trino = _trino_double()
+    composite, _ = _composite(trino)
+    composite._sources = _scoped_registry("sales")  # noqa: SLF001
+    await composite.execute('SELECT * FROM "sales"."orders"', namespace=_NS, data_source_id=_SRC)
+    composite._sources.sql_namespace_scope.assert_awaited()  # noqa: SLF001
+    trino.execute.assert_awaited_once()
+
+
+async def test_an_out_of_scope_reference_is_denied_before_trino_runs() -> None:
+    """The statement reaches the coordinator verbatim, so this is the only gate:
+    without it a qualified reference reads outside the namespace under the
+    source's single service identity."""
+    from coa_serve.tier2.sql_firewall import NamespaceSQLScopeError
+
+    trino = _trino_double()
+    composite, athena = _composite(trino)
+    composite._sources = _scoped_registry("sales")  # noqa: SLF001
+    with pytest.raises(NamespaceSQLScopeError):
+        await composite.execute(
+            'SELECT a.id FROM "sales"."orders" a JOIN "secret_hr"."salaries" b ON a.cid = b.cid',
+            namespace=_NS,
+            data_source_id=_SRC,
+        )
+    trino.execute.assert_not_awaited()
+    athena.execute.assert_not_awaited()
+
+
+async def test_a_bare_table_needs_no_scope_lookup() -> None:
+    """Unqualified SQL stays on the session catalog/schema, so there is nothing
+    that could escape the namespace."""
+    trino = _trino_double()
+    composite, _ = _composite(trino)
+    composite._sources = _scoped_registry("sales")  # noqa: SLF001
+    await composite.execute('SELECT * FROM "orders"', namespace=_NS, data_source_id=_SRC)
+    composite._sources.sql_namespace_scope.assert_not_awaited()  # noqa: SLF001
+    trino.execute.assert_awaited_once()
+
+
+# ── auth mode comes from authMode, not from secret keys ──────────────────
+
+
+def _auth(mode: str, secret: dict):
+    from coa_serve.clients.trino import _auth_from_secret
+
+    return _auth_from_secret(mode, secret)
+
+
+def test_basic_uses_the_username_as_the_trino_user() -> None:
+    auth, user = _auth("BASIC", {"username": "coa", "password": "pw"})
+    assert auth.__class__.__name__ == "BasicAuthentication"
+    assert user == "coa"
+
+
+def test_jwt_builds_bearer_auth() -> None:
+    auth, user = _auth("JWT", {"token": "h.e.s"})
+    assert auth.__class__.__name__ == "JWTAuthentication"
+    assert user == "coa-serve"
+
+
+@pytest.mark.parametrize(
+    ("mode", "secret"),
+    [
+        ("BASIC", {"username": "coa", "password": "pw", "token": "t"}),
+        ("JWT", {"token": "t", "username": "coa"}),
+    ],
+)
+def test_a_contradictory_secret_is_refused(mode: str, secret: dict) -> None:
+    """Discovery refuses these; serve must not silently accept them under the
+    other mode."""
+    with pytest.raises(TrinoQueryError, match="both"):
+        _auth(mode, secret)
+
+
+def test_a_basic_secret_missing_a_key_raises_a_typed_error() -> None:
+    """Not a bare KeyError, which would escape both error classes."""
+    with pytest.raises(TrinoQueryError, match="BASIC"):
+        _auth("BASIC", {"username": "coa"})
+
+
+@pytest.mark.parametrize("mode", ["", "OAUTH2_CLIENT_CREDENTIALS", "mtls"])
+def test_an_unsupported_mode_is_refused_rather_than_guessed(mode: str) -> None:
+    with pytest.raises(TrinoQueryError, match="authMode"):
+        _auth(mode, {"token": "t"})
+
+
+def test_the_declared_mode_wins_over_the_keys_present() -> None:
+    """A JWT-shaped secret under authMode BASIC is an error, not a silent switch."""
+    with pytest.raises(TrinoQueryError):
+        _auth("BASIC", {"token": "h.e.s"})
+
+
+async def test_a_three_part_reference_to_the_sources_own_table_is_allowed() -> None:
+    """Needs the TRINO arm in `sql_namespace_scope`; without it the catalog
+    authorizes nothing and a correctly-qualified query is denied."""
+    trino = _trino_double()
+    composite, _ = _composite(trino)
+    composite._sources = _scoped_registry(catalog_schemas={("iceberg", "sales")})  # noqa: SLF001
+    await composite.execute('SELECT * FROM "iceberg"."sales"."orders"', namespace=_NS, data_source_id=_SRC)
+    trino.execute.assert_awaited_once()
+
+
+async def test_a_three_part_reference_to_another_schema_is_denied() -> None:
+    from coa_serve.tier2.sql_firewall import NamespaceSQLScopeError
+
+    trino = _trino_double()
+    composite, athena = _composite(trino)
+    composite._sources = _scoped_registry(catalog_schemas={("iceberg", "sales")})  # noqa: SLF001
+    with pytest.raises(NamespaceSQLScopeError):
+        await composite.execute('SELECT * FROM "iceberg"."secret_hr"."salaries"', namespace=_NS, data_source_id=_SRC)
+    trino.execute.assert_not_awaited()
+    athena.execute.assert_not_awaited()

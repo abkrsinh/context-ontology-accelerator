@@ -65,6 +65,7 @@ class NamespaceLanguageUnavailableError(RuntimeError):
 _SOURCE_TYPE_DATABASE = "DATABASE"
 _SOURCE_TYPE_DOCUMENTS = "DOCUMENTS"
 _GLUE_SUB_TYPE = "GLUE_DATABASE"
+_TRINO_SUB_TYPE = "TRINO"
 # Athena's root catalog, lower-cased as the scope comparison is.
 _ROOT_CATALOG_LC = "awsdatacatalog"
 
@@ -486,6 +487,17 @@ class SourcesRegistry:
                 continue
 
             config = self.parse_configuration(item)
+
+            # Trino stores its schema as `schemaName` and claims no Athena catalog,
+            # so every other arm skips it and a 3-part reference to its own table
+            # would be denied.
+            if item.get("sourceSubType") == _TRINO_SUB_TYPE:
+                trino_catalog = str(config.get("catalog") or "").lower()
+                trino_schema = str(config.get("schemaName") or "").lower()
+                if _IDENTIFIER_PATTERN.fullmatch(trino_catalog) and _IDENTIFIER_PATTERN.fullmatch(trino_schema):
+                    federated_catalog_schemas.add((trino_catalog, trino_schema))
+                continue
+
             database = str(
                 item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
             ).lower()

@@ -362,7 +362,21 @@ class TestTrinoBranch:
     make — serve reaches its tables over the same coordinator discovery read. The skip is
     an explicit branch rather than a fallthrough so the scan record says why."""
 
-    _ITEM = {"sourceSubType": "TRINO"}
+    # Carries a configuration so the secret-grant path is actually reached; with a
+    # bare sub-type the ARN is "" and the grant is silently skipped.
+    _SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:t-AbCdEf"
+    _ITEM = {
+        "sourceSubType": "TRINO",
+        "configuration": json.dumps(
+            {
+                "uri": "https://trino.corp.com",
+                "catalog": "iceberg",
+                "schemaName": "sales",
+                "authMode": "BASIC",
+                "credentialSecretArn": _SECRET_ARN,
+            }
+        ),
+    }
 
     def test_marks_the_source_queryable_with_a_recorded_reason(self):
         from coa_sources.database.pipeline.federation_handler import handler
@@ -391,6 +405,51 @@ class TestTrinoBranch:
         grant.assert_not_called()
         grant_native.assert_not_called()
         iam_grant.assert_not_called()
+
+    def test_grants_the_consumer_read_on_the_credential_secret(self):
+        """Serve reads this secret at query time through its resource policy; without
+        the grant a Tier-2 query fails AccessDenied on GetSecretValue."""
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.require_secret_namespace_binding"),
+            patch(f"{MODULE}._grant_secret_read_to_consumer") as grant,
+        ):
+            handler(_EVENT)
+        grant.assert_called_once()
+        assert grant.call_args.args[0] == self._SECRET_ARN
+
+    def test_the_namespace_binding_is_rechecked_before_the_grant(self):
+        """The grant rewrites the secret's policy, so a tag list that changed
+        mid-scan must refuse rather than modify a secret we no longer own."""
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.require_secret_namespace_binding", side_effect=RuntimeError("unbound")),
+            patch(f"{MODULE}._grant_secret_read_to_consumer") as grant,
+            pytest.raises(RuntimeError, match="unbound"),
+        ):
+            handler(_EVENT)
+        grant.assert_not_called()
+
+    def test_a_source_with_no_secret_arn_skips_the_grant_cleanly(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao({"sourceSubType": "TRINO", "configuration": "{}"})
+        with (
+            ctx,
+            patch(f"{MODULE}.require_secret_namespace_binding") as require,
+            patch(f"{MODULE}._grant_secret_read_to_consumer") as grant,
+        ):
+            out = handler(_EVENT)
+        require.assert_not_called()
+        grant.assert_not_called()
+        assert out["queryable"] is True
+        dao.update.assert_called_once()
 
     def test_does_not_fall_through_to_the_not_jdbc_no_op(self):
         """The no-op writes nothing, so a Trino source would scan cleanly and then stay

@@ -174,8 +174,13 @@ iceberg.rest-catalog.signing-name=s3tables
 fs.native-s3.enabled=true
 s3.region=${this.region}
 CFG`,
+      // Tracing off across these two: `set -eux` would otherwise expand the
+      // password into cloud-init's log, readable via GetConsoleOutput.
+      "set +x",
       `PW=$(aws secretsmanager get-secret-value --region ${this.region} --secret-id ${this.credentialSecret.secretArn} --query SecretString --output text | jq -r .password)`,
       'htpasswd -bBC 10 -c /etc/trino/password.db coa "$PW"',
+      "unset PW",
+      "set -x",
       "docker run -d --restart=always --name trino -p 8080:8080 -v /etc/trino:/etc/trino trinodb/trino:484",
     );
 

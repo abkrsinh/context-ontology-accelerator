@@ -43,6 +43,7 @@ flowchart LR
 | JDBC | `JDBC_DATABASE` | Oracle | Athena federated only |
 | JDBC | `JDBC_DATABASE` | Snowflake | Athena federated only |
 | Databricks | `DATABRICKS_SQL_WAREHOUSE` | Databricks SQL Warehouse — nothing to deploy, the connector is operated for you | Athena only (Lambda-backed catalog) |
+| Trino | `TRINO` | A Trino cluster you operate — reaches whatever Trino federates (Iceberg REST, S3 Tables, Hive metastore, Nessie, Delta) | Trino directly (no Athena) |
 | Custom connector | `CUSTOM_CONNECTOR` | Databricks SQL Warehouse, deployed and operated by you from `connectors/databricks/` | Athena only (Lambda-backed catalog) |
 | Custom connector | `CUSTOM_CONNECTOR` | Any other source you can wrap in an Athena Query Federation SDK connector Lambda | Athena only (Lambda-backed catalog) |
 
@@ -54,6 +55,49 @@ flowchart LR
     [Custom Connector Sources](custom-connector-sources.md) for what the
     connector must return, the resource policies you must grant, and the
     governance disclosure that Lake Formation does not apply to that source type.
+
+### Trino
+
+Trino has a source sub-type of its own, `TRINO`. The source is **the coordinator, not the
+catalog beneath it**, so one sub-type reaches anything Trino federates: an Iceberg REST
+catalog, Amazon S3 Tables, a Hive metastore, Nessie, Delta, or a JDBC catalog. Discovery
+reads the coordinator's `information_schema`; serve-time SQL runs on that same coordinator,
+so the names recorded at scan time are the names queries use. One source exposes one schema.
+
+Unlike the Athena-federation routes, aggregation runs in Trino — `COUNT`/`SUM`/`GROUP BY`
+are not pulled through a Lambda, so there is no row ceiling on an aggregate over a large
+fact table.
+
+!!! warning "Trino's own access control does not apply to COA queries"
+    COA connects with **one service identity** from the source's credential secret, so every
+    COA caller reaches the union of what that identity can read. That matters more here than
+    elsewhere, because Trino is often deployed specifically as the authorization layer over a
+    lakehouse — this route bypasses it. Lake Formation does not govern this route either, the
+    same disclosure `CUSTOM_CONNECTOR` carries.
+
+**Prerequisites.** A Trino cluster reachable from the COA VPC on **443 over HTTPS** with a
+publicly trusted certificate (self-signed will not work — terminate TLS at a load balancer);
+the coordinator's host on the deployment's `trino_allowed_hosts`, which is **fail-closed**, so
+while it is empty no Trino source can be created or scanned; and a credential secret carrying
+the `<prefix>:namespace` tag, written with `scripts/tag_credential_secrets.py`. `authMode` is
+`BASIC` or `JWT` — there is deliberately no "no auth" mode, and OAuth2 and mTLS are not
+supported in this release.
+
+**Cost.** The cluster is yours, and so is its cost. COA caps returned rows but a generated
+aggregate can still be expensive, so put COA's identity in a resource group with a
+`query_max_execution_time` — otherwise COA becomes the noisiest neighbour and gets blamed
+for it.
+
+Identifiers (`catalog`, `schemaName`, and both table filters) are lowercased at registration,
+because Trino reports every name in lowercase — a filter of `ORDERS` would otherwise silently
+match nothing. Column comments become descriptions tagged `DETERMINISTIC`, nullability comes
+from `information_schema.is_nullable` rather than a comment convention, and `@pk`/`@fk` tags
+are still honoured; table descriptions always come from enrichment, as Trino exposes no table
+comment. A table listed with no readable columns lands in the scan's `failed_tables`.
+
+Not supported: writes, Iceberg time travel, Iceberg metadata beyond Trino's view, cross-source
+joins with a non-Trino source, delegated per-user auth, nested types as structured columns, and
+multi-level namespaces.
 
 ### Custom data source connectors
 

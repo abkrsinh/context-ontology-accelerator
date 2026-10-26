@@ -18,7 +18,7 @@ Security:
 - The coordinator URI is re-validated through the shared SSRF guard on every
   execute: an allowlisted hostname can be re-pointed after the source exists.
 - Trino's own fine-grained access control does NOT apply — one service identity
-  serves every caller. See the SC-2 disclosure in `external-docs/sources.md`.
+  serves every caller.
 
 A failure here must not cost a Tier-3 synthesis, so a per-namespace circuit
 breaker fails fast while open rather than letting the cascade fall through.
@@ -79,6 +79,33 @@ class _BreakerState:
 
     failures: list[float] = field(default_factory=list)
     opened_at: float = 0.0
+
+
+def _auth_from_secret(auth_mode: str, secret: dict[str, Any]) -> tuple[Any, str]:
+    """Build the client auth from the stored ``authMode``, refusing ambiguity.
+
+    Keyed on the declared mode rather than on which keys the secret happens to
+    carry, so serve and discovery agree: a secret ``trino_statement`` rejects as
+    contradictory is not silently accepted here under the other mode.
+    """
+    import trino  # noqa: PLC0415
+
+    mode = (auth_mode or "").upper()
+    if mode == "BASIC":
+        username, password = secret.get("username"), secret.get("password")
+        if not username or not password:
+            raise TrinoQueryError("authMode BASIC requires a secret with 'username' and 'password'")
+        if "token" in secret:
+            raise TrinoQueryError("secret carries both BASIC and JWT keys; refusing to guess the mode")
+        return trino.auth.BasicAuthentication(username, password), str(username)
+    if mode == "JWT":
+        token = secret.get("token")
+        if not token:
+            raise TrinoQueryError("authMode JWT requires a secret with 'token'")
+        if "username" in secret or "password" in secret:
+            raise TrinoQueryError("secret carries both JWT and BASIC keys; refusing to guess the mode")
+        return trino.auth.JWTAuthentication(token), "coa-serve"
+    raise TrinoQueryError(f"unsupported Trino authMode {auth_mode!r}")
 
 
 class TrinoQueryExecutor:
@@ -218,13 +245,9 @@ class TrinoQueryExecutor:
         import trino  # noqa: PLC0415
 
         parts = urlsplit(config["uri"])
-        secret = config.get("secret") or {}
-        if "token" in secret:
-            auth: Any = trino.auth.JWTAuthentication(secret["token"])
-            user = "coa-serve"
-        else:
-            auth = trino.auth.BasicAuthentication(secret["username"], secret["password"])
-            user = secret["username"]
+        auth, user = _auth_from_secret(
+            config.get("auth_mode") or config.get("authMode") or "", config.get("secret") or {}
+        )
 
         connection = trino.dbapi.connect(
             host=parts.hostname,

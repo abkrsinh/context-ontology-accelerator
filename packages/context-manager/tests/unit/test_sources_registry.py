@@ -1044,3 +1044,28 @@ class TestPooledGlueDatabases:
             federated_catalog_schemas=scope.federated_catalog_schemas,
             default_catalog="",
         )
+
+
+@pytest.mark.unit
+async def test_a_trino_source_contributes_its_catalog_and_schema_to_the_scope():
+    """Without this arm the executor's `default_catalog` authorizes nothing, so a
+    3-part reference to the source's own table is denied."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from coa_serve.clients.sources_registry import SourcesRegistry
+
+    reg = SourcesRegistry.__new__(SourcesRegistry)
+    reg._query_sources = AsyncMock(
+        return_value=[
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "TRINO",
+                "queryable": True,
+                "configuration": json.dumps({"catalog": "iceberg", "schemaName": "sales"}),
+            }
+        ]
+    )
+    scope = await reg.sql_namespace_scope("ns")
+    assert scope.federated_catalog_schemas == frozenset({("iceberg", "sales")})
+    assert scope.native_databases == frozenset()

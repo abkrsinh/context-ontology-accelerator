@@ -5,10 +5,12 @@
 
 Without this, accepting a URL from an API caller and fetching it from inside a
 private subnet turns source creation into an internal port scanner. The guard
-resolves the host ONCE, validates every address it resolved to, and returns a
-URL pinned to a validated address with the original hostname for the ``Host``
-header — closing the DNS-rebinding TOCTOU window where an attacker-controlled
-nameserver answers differently for the check and for the fetch.
+resolves the host once and validates every address it resolved to.
+
+It does NOT defeat DNS rebinding: the caller connects by hostname, so the client
+resolves again. What bounds that window is the ``https``-only scheme plus the
+client's certificate verification — a rebind to an internal service fails the
+handshake — together with re-validating on every scan and every query.
 
 Two gates, both of which must pass:
 
@@ -61,18 +63,8 @@ class UrlGuardError(ValueError):
 
 @dataclass(frozen=True)
 class ValidatedUrl:
-    """A URL proven safe to fetch, pinned to the address that was validated.
+    """A URL whose every resolved address passed both gates."""
 
-    Attributes:
-        pinned_url: Connect to THIS, not the original. Its host is the validated
-            IP, so no second DNS lookup can redirect the request.
-        hostname: The original hostname. Send it as ``Host``, and as the TLS
-            server name — connecting to a bare IP otherwise fails certificate
-            verification against any SNI-based host.
-        port: The resolved port, defaulted to 443.
-    """
-
-    pinned_url: str
     hostname: str
     port: int
 
@@ -99,7 +91,7 @@ def validate_url(
     allowed_hosts: Sequence[str] = (),
     field_name: str = "url",
 ) -> ValidatedUrl:
-    """Validate ``url`` and return it pinned to a verified address.
+    """Validate ``url``, refusing it unless every resolved address passes.
 
     Args:
         url: The caller-supplied URL. Must be ``https``.
@@ -138,7 +130,6 @@ def validate_url(
         raise UrlGuardError(f"{field_name} hostname resolved to no addresses")
 
     allowlisted = (not require_global) and _host_is_allowed(hostname, allowed_hosts)
-    validated: list[str] = []
     # EVERY address, not the first: a host answering with one public and one
     # loopback address would otherwise pass validation and could be fetched at
     # either, depending on resolver ordering.
@@ -150,9 +141,5 @@ def validate_url(
             raise UrlGuardError(f"{field_name} resolves to a forbidden address")
         if not ip.is_global and not allowlisted:
             raise UrlGuardError(f"{field_name} resolves to a non-routable address and its host is not allowlisted")
-        validated.append(str(ip))
 
-    pinned_ip = validated[0]
-    port = parsed.port or _DEFAULT_PORT
-    netloc = f"[{pinned_ip}]:{port}" if ":" in pinned_ip else f"{pinned_ip}:{port}"
-    return ValidatedUrl(pinned_url=parsed._replace(netloc=netloc).geturl(), hostname=hostname, port=port)
+    return ValidatedUrl(hostname=hostname, port=parsed.port or _DEFAULT_PORT)

@@ -279,3 +279,33 @@ def test_scan_tolerates_a_map_shaped_configuration(monkeypatch):
     raw["configuration"] = {"M": {"credentialSecretArn": {"S": a}}}
     monkeypatch.setattr(tcs.boto3, "client", lambda *a_, **k: _paginator([raw]))
     assert list(tcs._iter_credential_sources("t", "us-east-1")) == [(NS_A, "s", a)]
+
+
+@pytest.mark.unit
+def test_every_sub_type_with_a_credential_secret_is_listed():
+    """This script is the documented remediation for "secret not bound to this
+    namespace", so a sub-type it skips has no supported way to fix that error.
+
+    Derived from the Smithy model rather than restated, so a new configuration
+    carrying `credentialSecretArn` fails here instead of silently being skipped.
+    """
+    from coa_control_plane_server.models import (
+        custom_connector_configuration,
+        databricks_sql_warehouse_configuration,
+        jdbc_configuration,
+        trino_configuration,
+    )
+
+    from scripts.tag_credential_secrets import CREDENTIAL_SUB_TYPES
+
+    carries_secret = {
+        "JDBC_DATABASE": jdbc_configuration.JdbcConfiguration,
+        "DATABRICKS_SQL_WAREHOUSE": databricks_sql_warehouse_configuration.DatabricksSqlWarehouseConfiguration,
+        "TRINO": trino_configuration.TrinoConfiguration,
+        "CUSTOM_CONNECTOR": custom_connector_configuration.CustomConnectorConfiguration,
+    }
+    expected = {sub_type for sub_type, model in carries_secret.items() if "credential_secret_arn" in model.model_fields}
+    assert expected == set(CREDENTIAL_SUB_TYPES), (
+        f"sub-types whose configuration carries credentialSecretArn: {sorted(expected)}; "
+        f"CREDENTIAL_SUB_TYPES: {sorted(CREDENTIAL_SUB_TYPES)}"
+    )

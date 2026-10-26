@@ -111,7 +111,7 @@ from coa_common.constants import (  # noqa: E402
 
 # Sub-types whose configuration carries a `credentialSecretArn` governed by the
 # namespace binding.
-CREDENTIAL_SUB_TYPES = frozenset({"JDBC_DATABASE", "DATABRICKS_SQL_WAREHOUSE"})
+CREDENTIAL_SUB_TYPES = frozenset({"JDBC_DATABASE", "DATABRICKS_SQL_WAREHOUSE", "TRINO"})
 
 # Secrets Manager caps a tag VALUE at 256 characters.
 TAG_VALUE_MAX = 256
