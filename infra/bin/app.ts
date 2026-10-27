@@ -586,6 +586,9 @@ async function deploy(): Promise<void> {
         .split(",")
         .map((v) => v.trim())
         .filter(Boolean),
+      seedEnabled:
+        app.node.tryGetContext("trino_test_seed_enabled") === "true" ||
+        app.node.tryGetContext("trino_test_seed_enabled") === true,
       namespaceId: app.node.tryGetContext("trino_test_namespace_id") as
         | string
         | undefined,

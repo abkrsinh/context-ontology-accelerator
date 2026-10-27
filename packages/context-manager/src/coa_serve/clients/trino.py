@@ -29,8 +29,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,7 @@ import sqlglot
 import sqlglot.errors
 import structlog
 from coa_common import resolve_region
+from coa_common.metrics import emit_metric
 from coa_common.net import UrlGuardError, validate_url
 
 from ..query_utils import validate_namespace
@@ -61,6 +63,39 @@ _ALLOWED_HOSTS = tuple(h.strip() for h in os.environ.get("TRINO_ALLOWED_HOSTS", 
 _BREAKER_THRESHOLD = int(os.environ.get("TRINO_BREAKER_FAILURE_THRESHOLD", "5"))
 _BREAKER_WINDOW_S = float(os.environ.get("TRINO_BREAKER_WINDOW_S", "60"))
 _BREAKER_OPEN_S = float(os.environ.get("TRINO_BREAKER_OPEN_S", "30"))
+
+# Uncached, every query costs a GetSecretValue on the Tier-2 hot path. The TTL is
+# also the window a rotated credential stays in use, so it is capped.
+_SECRET_CACHE_TTL_CEILING_S = 900.0
+_SECRET_CACHE_MAX = 128
+
+
+def _secret_cache_ttl(raw: str | None) -> float:
+    """Clamp the configured TTL to the ceiling, falling back on an unreadable value.
+
+    A malformed value must not take serve down at import, and must not be read as
+    "no caching" either — that would restore the per-query GetSecretValue.
+
+    Zero or less is honoured as an explicit opt-out, but logged: it reinstates a
+    GetSecretValue per query, so it must not be reachable by typo in silence.
+    """
+    try:
+        requested = float(raw) if raw else _SECRET_CACHE_TTL_CEILING_S
+    except ValueError:
+        logger.warning("trino_secret_cache_ttl_unreadable", value=raw)
+        requested = _SECRET_CACHE_TTL_CEILING_S
+    if requested <= 0:
+        logger.warning("trino_secret_cache_disabled", value=raw)
+        return 0.0
+    return min(requested, _SECRET_CACHE_TTL_CEILING_S)
+
+
+_SECRET_CACHE_TTL_S = _secret_cache_ttl(os.environ.get("TRINO_SECRET_CACHE_TTL_S"))
+
+# Stdout EMF, extracted by the runtime's log pipeline, so the serve role needs no
+# PutMetricData grant. Discovery-side Trino volume is already covered by the
+# SourceType-dimensioned metrics the scan pipeline emits.
+_METRICS_NAMESPACE = "COA/Serve"
 
 _firewall = SQLFirewall()
 
@@ -108,6 +143,19 @@ def _auth_from_secret(auth_mode: str, secret: dict[str, Any]) -> tuple[Any, str]
     raise TrinoQueryError(f"unsupported Trino authMode {auth_mode!r}")
 
 
+def _is_auth_failure(exc: Exception) -> bool:
+    """Whether the coordinator rejected the credential rather than the statement.
+
+    Matched on the message because the client collapses both into one error type.
+    A stale credential arrives as ``error 401: ...``; Trino's PERMISSION_DENIED
+    ("Access Denied: Cannot select from table") is deliberately NOT matched — the
+    credential is valid there, so re-reading it cannot help, and a least-privilege
+    credential makes that the common denial rather than a rare one.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in ("401", "unauthorized", "authentication failed"))
+
+
 class TrinoQueryExecutor:
     """Executes serve-time SQL on a Trino coordinator.
 
@@ -129,6 +177,9 @@ class TrinoQueryExecutor:
         self._max_rows = max_rows
         self._secrets = boto3.client("secretsmanager", region_name=self._region)
         self._breakers: dict[str, _BreakerState] = defaultdict(_BreakerState)
+        self._secret_cache: OrderedDict[str, tuple[dict[str, Any], float]] = OrderedDict()
+        # Guards the dict only; a cold race fetches twice.
+        self._secret_lock = threading.Lock()
 
     @instrumented("trino")
     async def execute(
@@ -172,11 +223,19 @@ class TrinoQueryExecutor:
                 self._run, statement, config, min(max_rows, self._max_rows), timeout_seconds
             )
         except TrinoUnavailableError:
+            emit_metric(_METRICS_NAMESPACE, "TrinoQueryFailures", 1, "Count", FailureClass="unavailable")
             self._record_failure(namespace)
+            raise
+        except Exception as exc:
+            emit_metric(_METRICS_NAMESPACE, "TrinoQueryFailures", 1, "Count", FailureClass=type(exc).__name__)
+            # Without this a rotated credential fails every query until the entry ages out.
+            if _is_auth_failure(exc):
+                self._evict_secret(config.get("credentialSecretArn", ""))
             raise
         self._record_success(namespace)
 
         duration_ms = int((time.perf_counter() - start) * 1000)
+        emit_metric(_METRICS_NAMESPACE, "TrinoQueryDuration", duration_ms, "Milliseconds")
         logger.info(
             "trino_query_executed",
             namespace=namespace,
@@ -226,10 +285,33 @@ class TrinoQueryExecutor:
         return {**config, "secret": secret}
 
     def _fetch_secret(self, secret_arn: str) -> dict[str, Any]:
+        """Read the credential, reusing a cached copy within the TTL."""
         if not secret_arn:
             raise ValueError("Trino source carries no credentialSecretArn")
+        now = time.monotonic()
+        with self._secret_lock:
+            cached = self._secret_cache.get(secret_arn)
+            if cached is not None and now - cached[1] < _SECRET_CACHE_TTL_S:
+                self._secret_cache.move_to_end(secret_arn)
+                return cached[0]
+
         response = self._secrets.get_secret_value(SecretId=secret_arn)
-        return json.loads(response["SecretString"])
+        secret = json.loads(response["SecretString"])
+
+        with self._secret_lock:
+            self._secret_cache[secret_arn] = (secret, time.monotonic())
+            self._secret_cache.move_to_end(secret_arn)
+            while len(self._secret_cache) > _SECRET_CACHE_MAX:
+                self._secret_cache.popitem(last=False)
+        return secret
+
+    def _evict_secret(self, secret_arn: str) -> None:
+        """Drop a cached credential so the next query re-reads it."""
+        if not secret_arn:
+            return
+        with self._secret_lock:
+            if self._secret_cache.pop(secret_arn, None) is not None:
+                logger.info("trino_secret_cache_evicted", secret_arn=secret_arn)
 
     @staticmethod
     def _run(
@@ -259,6 +341,10 @@ class TrinoQueryExecutor:
             schema=config.get("schemaName"),
             source="coa-serve",
             request_timeout=float(timeout_seconds),
+            # request_timeout bounds each poll of the nextUri chain, not the query,
+            # and to_thread cannot be cancelled — so the coordinator enforces the
+            # total, and abandoning the client does not leave the query running.
+            session_properties={"query_max_run_time": f"{timeout_seconds}s"},
         )
         try:
             cursor = connection.cursor()
@@ -326,6 +412,7 @@ class TrinoQueryExecutor:
         state.failures.append(now)
         if len(state.failures) >= _BREAKER_THRESHOLD:
             state.opened_at = now
+            emit_metric(_METRICS_NAMESPACE, "TrinoCircuitBreakerOpen", 1, "Count")
             logger.warning("trino_circuit_breaker_open", namespace=namespace, failures=len(state.failures))
 
     def _record_success(self, namespace: str) -> None:

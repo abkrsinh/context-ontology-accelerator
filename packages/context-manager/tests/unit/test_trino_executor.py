@@ -146,6 +146,13 @@ def _fake_run(rows, columns=("a",), truncated=False):
     return lambda *_a, **_k: (rows, list(columns), truncated)
 
 
+def _fake_raise(error: Exception):
+    def boom(*_a, **_k):
+        raise error
+
+    return boom
+
+
 @contextlib.contextmanager
 def _reachable(host: str = "trino.corp.com"):
     """Allowlist ``host`` and stub DNS — the guard resolves for real otherwise."""
@@ -483,3 +490,211 @@ async def test_a_three_part_reference_to_another_schema_is_denied() -> None:
         await composite.execute('SELECT * FROM "iceberg"."secret_hr"."salaries"', namespace=_NS, data_source_id=_SRC)
     trino.execute.assert_not_awaited()
     athena.execute.assert_not_awaited()
+
+
+# ── Credential cache ─────────────────────────────────────────────────────
+
+
+async def _query(ex: TrinoQueryExecutor, namespace: str = _NS) -> None:
+    with (
+        _reachable(),
+        patch.object(TrinoQueryExecutor, "_run", staticmethod(_fake_run([{"a": 1}]))),
+    ):
+        await ex.execute("SELECT a FROM t", namespace=namespace, data_source_id=_SRC)
+
+
+async def test_a_repeat_query_reuses_the_cached_credential() -> None:
+    """Uncached, every Tier-2 query spends a GetSecretValue against its rate limit."""
+    ex = _executor()
+    await _query(ex)
+    await _query(ex)
+    assert ex._secrets.get_secret_value.call_count == 1  # noqa: SLF001
+
+
+async def test_an_expired_entry_is_refetched() -> None:
+    """The TTL is what bounds how long a rotated credential stays in use."""
+    ex = _executor()
+    with patch(f"{_MODULE}._SECRET_CACHE_TTL_S", 0.0):
+        await _query(ex)
+        await _query(ex)
+    assert ex._secrets.get_secret_value.call_count == 2  # noqa: SLF001
+
+
+async def test_each_secret_is_cached_separately() -> None:
+    ex = _executor()
+    await _query(ex)
+    other = dict(_CONFIG, credentialSecretArn="arn:aws:secretsmanager:us-east-1:123456789012:secret:other-ZyXwVu")
+    ex._sources.get_source = AsyncMock(  # noqa: SLF001
+        return_value={"queryEngine": "TRINO", "queryable": True, "configuration": json.dumps(other)}
+    )
+    await _query(ex)
+    assert ex._secrets.get_secret_value.call_count == 2  # noqa: SLF001
+    assert len(ex._secret_cache) == 2  # noqa: SLF001
+
+
+async def test_the_cache_is_bounded() -> None:
+    """A long-lived runtime must not accumulate credentials indefinitely."""
+    ex = _executor()
+    with patch(f"{_MODULE}._SECRET_CACHE_MAX", 2):
+        for n in range(4):
+            arn = f"arn:aws:secretsmanager:us-east-1:123456789012:secret:s{n}-AbCdEf"
+            ex._sources.get_source = AsyncMock(  # noqa: SLF001
+                return_value={
+                    "queryEngine": "TRINO",
+                    "queryable": True,
+                    "configuration": json.dumps(dict(_CONFIG, credentialSecretArn=arn)),
+                }
+            )
+            await _query(ex)
+    assert len(ex._secret_cache) == 2  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("configured", "expect"),
+    [
+        ("99999", 900.0),  # the docs promise 15 minutes; a bigger value cannot make that false
+        ("60", 60.0),
+        (None, 900.0),
+        ("", 900.0),
+        ("not-a-number", 900.0),  # a typo must not take serve down at import
+        ("0", 0.0),  # explicit opt-out, logged rather than silent
+        ("-5", 0.0),
+    ],
+)
+def test_the_ttl_is_clamped_to_the_documented_ceiling(configured: str | None, expect: float) -> None:
+    from coa_serve.clients.trino import _secret_cache_ttl
+
+    assert _secret_cache_ttl(configured) == expect
+
+
+async def test_an_auth_failure_evicts_the_cached_credential() -> None:
+    """Otherwise a rotated credential fails every query until the TTL expires,
+    while discovery — which has no cache — already works."""
+    ex = _executor()
+    await _query(ex)
+    assert len(ex._secret_cache) == 1  # noqa: SLF001
+    with (
+        _reachable(),
+        patch.object(
+            TrinoQueryExecutor,
+            "_run",
+            staticmethod(_fake_raise(TrinoQueryError("Error 401: Unauthorized"))),
+        ),
+        pytest.raises(TrinoQueryError),
+    ):
+        await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+    assert len(ex._secret_cache) == 0  # noqa: SLF001
+
+
+async def test_a_rejected_statement_keeps_the_cached_credential() -> None:
+    """A broad match would re-read the secret on every bad statement."""
+    ex = _executor()
+    await _query(ex)
+    with (
+        _reachable(),
+        patch.object(
+            TrinoQueryExecutor,
+            "_run",
+            staticmethod(_fake_raise(TrinoQueryError("TABLE_NOT_FOUND: no such table"))),
+        ),
+        pytest.raises(TrinoQueryError),
+    ):
+        await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+    assert len(ex._secret_cache) == 1  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("message", "expect"),
+    [
+        ("error 401: Invalid credentials", True),
+        ("Authentication failed for user coa", True),
+        ("Access Denied: Cannot select from table sales.orders", False),
+        ("TABLE_NOT_FOUND", False),
+        ("SYNTAX_ERROR: line 1:8", False),
+    ],
+)
+def test_auth_failures_are_recognised_narrowly(message: str, expect: bool) -> None:
+    from coa_serve.clients.trino import _is_auth_failure
+
+    assert _is_auth_failure(TrinoQueryError(message)) is expect
+
+
+# ── Total query budget ───────────────────────────────────────────────────
+
+
+def _connect_double():
+    """A stubbed ``trino.dbapi.connect`` returning one row."""
+    connection = MagicMock()
+    cursor = connection.cursor.return_value
+    cursor.fetchmany.return_value = [(1,)]
+    cursor.description = [("a",)]
+    return connection
+
+
+def test_the_coordinator_enforces_the_total_budget() -> None:
+    """request_timeout bounds each poll of the nextUri chain, so without this a
+    long query outlives its budget and survives the client giving up."""
+    connection = _connect_double()
+    with patch("trino.dbapi.connect", return_value=connection) as connect:
+        TrinoQueryExecutor._run(  # noqa: SLF001
+            "SELECT a FROM t LIMIT 10",
+            {**_CONFIG, "secret": {"username": "coa", "password": "pw"}},
+            10,
+            17,
+        )
+    assert connect.call_args.kwargs["session_properties"] == {"query_max_run_time": "17s"}
+    assert connect.call_args.kwargs["request_timeout"] == 17.0
+
+
+# ── Serve-side metrics ───────────────────────────────────────────────────
+
+
+async def test_a_successful_query_emits_its_duration() -> None:
+    """Discovery volume rides the SourceType-dimensioned scan metrics; serve has
+    no equivalent, so without this the Tier-2 path is invisible to CloudWatch."""
+    ex = _executor()
+    with patch(f"{_MODULE}.emit_metric") as emit:
+        await _query(ex)
+    names = [c.args[1] for c in emit.call_args_list]
+    assert "TrinoQueryDuration" in names
+
+
+async def test_an_unreachable_coordinator_is_counted_by_class() -> None:
+    ex = _executor()
+    with (
+        patch(f"{_MODULE}.emit_metric") as emit,
+        _reachable(),
+        patch.object(TrinoQueryExecutor, "_run", staticmethod(_fake_raise(TrinoUnavailableError("down")))),
+        pytest.raises(TrinoUnavailableError),
+    ):
+        await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+    failures = [c for c in emit.call_args_list if c.args[1] == "TrinoQueryFailures"]
+    assert failures and failures[0].kwargs["FailureClass"] == "unavailable"
+
+
+async def test_a_rejected_query_is_counted_under_its_own_class() -> None:
+    """Separating these is what lets a dashboard tell a broken cluster from a
+    broken statement — only the first should ever page."""
+    ex = _executor()
+    with (
+        patch(f"{_MODULE}.emit_metric") as emit,
+        _reachable(),
+        patch.object(TrinoQueryExecutor, "_run", staticmethod(_fake_raise(TrinoQueryError("TABLE_NOT_FOUND")))),
+        pytest.raises(TrinoQueryError),
+    ):
+        await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+    failures = [c for c in emit.call_args_list if c.args[1] == "TrinoQueryFailures"]
+    assert failures and failures[0].kwargs["FailureClass"] == "TrinoQueryError"
+
+
+async def test_the_breaker_opening_is_counted() -> None:
+    ex = _executor()
+    with patch(f"{_MODULE}._BREAKER_THRESHOLD", 2), patch(f"{_MODULE}.emit_metric") as emit:
+        await _fail_n_times(ex, 2, TrinoUnavailableError("down"))
+    assert "TrinoCircuitBreakerOpen" in [c.args[1] for c in emit.call_args_list]
+
+
+def test_metrics_go_to_the_serve_namespace() -> None:
+    from coa_serve.clients.trino import _METRICS_NAMESPACE
+
+    assert _METRICS_NAMESPACE == "COA/Serve"

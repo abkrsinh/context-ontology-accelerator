@@ -519,6 +519,14 @@ export class ServeStack extends SCLStack {
                 | undefined) ?? [];
             return Array.isArray(hosts) ? hosts.join(",") : String(hosts);
           })(),
+          // Lower to shorten the window a rotated Trino credential stays in use;
+          // the executor caps it, so raising it past the default has no effect.
+          TRINO_SECRET_CACHE_TTL_S: String(
+            (this.node.tryGetContext("trino_secret_cache_ttl_s") as
+              | number
+              | string
+              | undefined) ?? 900,
+          ),
           OSS_ONTOLOGY_INDEX: opensearchCollectionName,
           // Default engine for a request that does not set `options.mode`. Standard
           // (not deep reasoning), because deep reasoning runs ~90s at p50 and the

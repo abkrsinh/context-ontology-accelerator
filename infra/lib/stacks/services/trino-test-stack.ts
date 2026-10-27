@@ -30,6 +30,10 @@ export interface TrinoTestStackProps extends cdk.StackProps {
    *  Taken as ids rather than imported, so the product stacks export nothing for
    *  test infrastructure. */
   readonly extraClientSecurityGroupIds?: string[];
+  /** Allow Trino to WRITE to the table bucket, and add the built-in `tpch`
+   *  catalog to seed from. Off by default: the steady state is read-only, and a
+   *  demo that can create tables is not what a query endpoint needs. */
+  readonly seedEnabled?: boolean;
   /** Namespace the credential secret is tagged for, so discovery may read it. */
   readonly namespaceId?: string;
 }
@@ -128,6 +132,24 @@ export class TrinoTestStack extends SCLStack {
     });
     this.credentialSecret.grantRead(role);
 
+    if (props.seedEnabled) {
+      // Scoped to this table bucket rather than AmazonS3TablesFullAccess, which
+      // is account-wide. ADD COLUMN needs the metadata-location write too.
+      role.addToPolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "s3tables:CreateNamespace",
+            "s3tables:CreateTable",
+            "s3tables:DeleteTable",
+            "s3tables:PutTableData",
+            "s3tables:GetTableMetadataLocation",
+            "s3tables:UpdateTableMetadataLocation",
+          ],
+          resources: [props.tableBucketArn, `${props.tableBucketArn}/*`],
+        }),
+      );
+    }
+
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
       "set -eux",
@@ -174,6 +196,16 @@ iceberg.rest-catalog.signing-name=s3tables
 fs.native-s3.enabled=true
 s3.region=${this.region}
 CFG`,
+      // Generates its data on read, so seeding needs no staged files and no
+      // second data source to manage.
+      ...(props.seedEnabled
+        ? [
+            `cat > /etc/trino/catalog/tpch.properties <<'CFG'
+connector.name=tpch
+tpch.splits-per-node=4
+CFG`,
+          ]
+        : []),
       // Tracing off across these two: `set -eux` would otherwise expand the
       // password into cloud-init's log, readable via GetConsoleOutput.
       "set +x",

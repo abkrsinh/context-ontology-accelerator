@@ -238,6 +238,44 @@ async function fillDatabricksStep(
     await user.type(screen.getByPlaceholderText(DATABRICKS_ROLE_ARN), roleArn);
 }
 
+const TRINO_URI = "https://trino.example.com:443";
+const TRINO_SECRET_ARN =
+  "arn:aws:secretsmanager:us-east-1:123456789012:secret:trino-abc123";
+
+/** Fill the Trino form. No role ARN: the credential secret is read through its
+ *  own resource policy, so there is no role to assume. */
+async function fillTrinoStep(
+  overrides: {
+    uri?: string;
+    catalog?: string;
+    schema?: string;
+    secretArn?: string;
+  } = {},
+) {
+  await user.click(screen.getByLabelText("Trino"));
+  await clickNext();
+  await user.type(
+    screen.getByPlaceholderText("My Trino Lakehouse"),
+    "my-lakehouse",
+  );
+  await user.type(
+    screen.getByPlaceholderText(TRINO_URI),
+    overrides.uri ?? TRINO_URI,
+  );
+  await user.type(
+    screen.getByPlaceholderText("iceberg"),
+    overrides.catalog ?? "iceberg",
+  );
+  await user.type(
+    screen.getByPlaceholderText("sales"),
+    overrides.schema ?? "sales",
+  );
+  await user.type(
+    screen.getByPlaceholderText(TRINO_SECRET_ARN),
+    overrides.secretArn ?? TRINO_SECRET_ARN,
+  );
+}
+
 /** Select the Documents tile, name the source, and attach one file.
  *
  *  Cloudscape's file input mirrors its value prop onto the native control by
@@ -1007,6 +1045,210 @@ describe("ConnectSource — Athena Query Federation connector", () => {
     expect(screen.queryByText(/composite handler/i)).not.toBeInTheDocument();
     expect(screen.queryByText("Record function ARN")).not.toBeInTheDocument();
   }, 15000);
+});
+
+describe("ConnectSource — Trino", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+    resetNamespaceQuery();
+  });
+
+  it("offers Trino as a step-1 source kind", () => {
+    render(<ConnectSource />, { wrapper });
+
+    expect(screen.getByLabelText("Trino")).toBeInTheDocument();
+  });
+
+  it("selects the tile and shows the coordinator form", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Trino"));
+    await clickNext();
+
+    expect(screen.getByText("Coordinator")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(TRINO_URI)).toBeInTheDocument();
+  });
+
+  it("treats Trino as a database source — the enrichment step is present", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep();
+    await clickNext();
+
+    expect(
+      screen.getByText(/Enable AI metadata enrichment/i),
+    ).toBeInTheDocument();
+  }, 25000);
+
+  it("submits trinoConfiguration and nothing else", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep();
+    await clickNext(); // → enrichment
+    await clickNext(); // → review
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const databaseSource = mockCreate.mock.calls[0][0].body.databaseSource;
+    expect(databaseSource.name).toBe("my-lakehouse");
+    expect(databaseSource.trinoConfiguration).toEqual({
+      uri: TRINO_URI,
+      catalog: "iceberg",
+      schemaName: "sales",
+      authMode: "BASIC",
+      credentialSecretArn: TRINO_SECRET_ARN,
+      tableFilter: undefined,
+      tableExcludeFilter: undefined,
+    });
+    // The backend 400s when more than one configuration is present — the
+    // configuration sent is what selects the sub-type.
+    expect(databaseSource.glueConfiguration).toBeUndefined();
+    expect(databaseSource.jdbcConfiguration).toBeUndefined();
+    expect(databaseSource.customConnectorConfiguration).toBeUndefined();
+    expect(databaseSource.databricksSqlWarehouseConfiguration).toBeUndefined();
+  }, 25000);
+
+  it("discloses that Trino's access control does not apply, at credential entry", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Trino"));
+    await clickNext();
+
+    // The operator meets this where they paste the credential, not only in the
+    // docs: a single service identity is what collapses Trino's own authz.
+    expect(
+      screen.getByText(/access control does not apply/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/single service identity/i)).toBeInTheDocument();
+  });
+
+  it("asks for no cross-account role — the secret is read via its resource policy", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Trino"));
+    await clickNext();
+
+    expect(
+      screen.queryByText(/Credential access role ARN/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("defaults to BASIC and submits JWT when chosen", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep();
+    await user.click(screen.getByLabelText("JWT"));
+    await clickNext();
+    await clickNext();
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+
+    expect(
+      mockCreate.mock.calls[0][0].body.databaseSource.trinoConfiguration
+        .authMode,
+    ).toBe("JWT");
+  }, 25000);
+
+  it("describes the secret shape the chosen mode requires", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Trino"));
+    await clickNext();
+
+    expect(screen.getByText(/"username"/)).toBeInTheDocument();
+    await user.click(screen.getByLabelText("JWT"));
+    // The shapes are mutually exclusive — a secret carrying both is refused at
+    // create, so the form must not describe both at once.
+    expect(screen.queryByText(/"username"/)).not.toBeInTheDocument();
+    expect(screen.getByText(/"token"/)).toBeInTheDocument();
+  }, 25000);
+
+  it("blocks Next on a plain-http coordinator URI", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep({ uri: "http://trino.example.com" });
+    await clickNext();
+
+    expect(screen.getByText(/https host with no path/i)).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 25000);
+
+  it("blocks Next on a coordinator URI carrying a path", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep({ uri: "https://trino.example.com/v1/statement" });
+    await clickNext();
+
+    expect(screen.getByText(/https host with no path/i)).toBeInTheDocument();
+  }, 25000);
+
+  it("rejects a dotted schema with the namespace limit, not a typo message", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep({ schema: "prod.sales" });
+    await clickNext();
+
+    // Trino itself refuses multi-level namespaces unless nested-namespace-enabled
+    // is set, so the error has to explain the limit rather than read as a typo.
+    expect(
+      screen.getByText(/multi-level namespaces are not supported/i),
+    ).toBeInTheDocument();
+  }, 25000);
+
+  it("rejects a catalog that is not a SQL identifier", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep({ catalog: "iceberg-prod" });
+    await clickNext();
+
+    expect(screen.getByText(/Must be a SQL identifier/i)).toBeInTheDocument();
+  }, 25000);
+
+  it("rejects a credential secret ARN that is not a Secrets Manager ARN", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep({ secretArn: "arn:aws:kms:us-east-1:1:key/abc" });
+    await clickNext();
+
+    expect(
+      screen.getByText(/Must be a Secrets Manager secret ARN/i),
+    ).toBeInTheDocument();
+  }, 25000);
+
+  it("submits the table filters when provided", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep();
+    await user.click(screen.getByText("Advanced configuration"));
+    await user.type(
+      screen.getByPlaceholderText("orders|customers"),
+      "orders|customers",
+    );
+    await user.type(
+      screen.getByPlaceholderText("tmp_*|staging_*"),
+      "staging_*",
+    );
+    await clickNext();
+    await clickNext();
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+
+    const config =
+      mockCreate.mock.calls[0][0].body.databaseSource.trinoConfiguration;
+    expect(config.tableFilter).toBe("orders|customers");
+    expect(config.tableExcludeFilter).toBe("staging_*");
+  }, 25000);
+
+  it("summarises the connection on the review step", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillTrinoStep();
+    await clickNext();
+    await clickNext();
+
+    expect(screen.getByText(TRINO_URI)).toBeInTheDocument();
+    expect(screen.getByText("iceberg")).toBeInTheDocument();
+    expect(screen.getByText("BASIC")).toBeInTheDocument();
+  }, 25000);
 });
 
 describe("ConnectSource — Databricks SQL Warehouse", () => {

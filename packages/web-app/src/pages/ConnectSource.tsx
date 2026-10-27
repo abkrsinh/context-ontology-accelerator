@@ -144,12 +144,13 @@ import type { AppMessage } from "../i18n/appMessages";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
-// Five-way selection shown in step 1
+// Six-way selection shown in step 1
 type SourceKind =
   | "GLUE_DATABASE"
   | "JDBC_DATABASE"
   | "CUSTOM_CONNECTOR"
   | "DATABRICKS_SQL_WAREHOUSE"
+  | "TRINO"
   | "DOCUMENTS";
 
 /** Narrow a Tiles selection to a SourceKind. Cloudscape hands back a plain
@@ -160,6 +161,7 @@ function isSourceKind(value: string): value is SourceKind {
     value === "JDBC_DATABASE" ||
     value === "CUSTOM_CONNECTOR" ||
     value === "DATABRICKS_SQL_WAREHOUSE" ||
+    value === "TRINO" ||
     value === "DOCUMENTS"
   );
 }
@@ -172,6 +174,9 @@ const SOURCE_KIND_LABELS: Record<SourceKind, AppMessage> = {
   // The sub-type covers a SQL Warehouse only — not Databricks jobs, Delta
   // Sharing or a cluster endpoint.
   DATABRICKS_SQL_WAREHOUSE: "Databricks SQL Warehouse",
+  // The source is the coordinator, not the catalog under it, so one sub-type
+  // reaches anything Trino federates.
+  TRINO: "Trino",
   DOCUMENTS: "Documents",
 };
 
@@ -209,6 +214,34 @@ const GLUE_EXECUTION_ENGINE_OPTIONS: {
       "Query Glue/Iceberg tables via Redshift Serverless (awsdatacatalog auto-mount).",
   },
 ];
+
+// Trino authentication. There is deliberately no "none": a source that
+// authenticates nothing is refused at create.
+type TrinoAuthMode = "BASIC" | "JWT";
+
+const TRINO_AUTH_MODE_OPTIONS: {
+  value: TrinoAuthMode;
+  label: AppMessage;
+  description: AppMessage;
+}[] = [
+  {
+    value: "BASIC",
+    label: "Basic",
+    description:
+      "Username and password, against Trino's password authenticator.",
+  },
+  {
+    value: "JWT",
+    label: "JWT",
+    description: "A bearer token you mint and rotate.",
+  },
+];
+
+// Guard rather than an assertion, per project convention: an unrecognised value
+// leaves the current mode alone instead of writing one the secret-shape
+// description and the backend validator cannot agree on.
+const isTrinoAuthMode = (value: string): value is TrinoAuthMode =>
+  value === "BASIC" || value === "JWT";
 
 const DEFAULT_PORTS: Record<DatabaseEngine, string> = {
   POSTGRESQL: "5432",
@@ -303,6 +336,18 @@ interface Model {
   databricksCrossAccountRoleArn: string;
   databricksTableFilter: string;
   databricksTableExcludeFilter: string;
+  // Trino: one coordinator URI serves both discovery and query, so there is no
+  // second endpoint and no cross-account role — the credential secret is read
+  // through its own resource policy.
+  trinoName: string;
+  trinoUri: string;
+  trinoCatalog: string;
+  // `schemaName` on the wire, one schema per source.
+  trinoSchemaName: string;
+  trinoAuthMode: TrinoAuthMode;
+  trinoSecretArn: string;
+  trinoTableFilter: string;
+  trinoTableExcludeFilter: string;
   // Shared database enrichment toggle — when false, the backend skips the
   // AI metadata enrichment step entirely and only persists discovered
   // technical metadata for steward review.
@@ -484,6 +529,14 @@ const initialModel: Model = {
   databricksCrossAccountRoleArn: "",
   databricksTableFilter: "",
   databricksTableExcludeFilter: "",
+  trinoName: "",
+  trinoUri: "",
+  trinoCatalog: "",
+  trinoSchemaName: "",
+  trinoAuthMode: "BASIC",
+  trinoSecretArn: "",
+  trinoTableFilter: "",
+  trinoTableExcludeFilter: "",
   metadataEnrichmentEnabled: true,
   docUploadName: "",
   docUploadFiles: [],
@@ -612,6 +665,11 @@ const DATABRICKS_HTTP_PATH_RE =
   /^\/sql\/1\.0\/(warehouses|endpoints)\/[a-zA-Z0-9]+$/;
 // Unity Catalog catalog and schema are both plain SQL identifiers.
 const DATABRICKS_IDENTIFIER_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+// Mirrors TrinoUri in the Smithy model. ASCII-only host, no path: the model
+// rejects anything else before the SSRF guard sees it, so accepting more here
+// would only move a rejection from this form to an opaque 400.
+const TRINO_URI_RE =
+  /^https:\/\/[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:\d{1,5})?$/;
 const SECRET_ARN_RE =
   /^arn:(aws|aws-us-gov):secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$/;
 
@@ -662,6 +720,11 @@ interface ValidationErrors {
   databricksSchemaName?: string;
   databricksSecretArn?: string;
   databricksCrossAccountRoleArn?: string;
+  trinoName?: string;
+  trinoUri?: string;
+  trinoCatalog?: string;
+  trinoSchemaName?: string;
+  trinoSecretArn?: string;
   docUploadName?: string;
   docFiles?: string;
   docS3Name?: string;
@@ -683,6 +746,8 @@ function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
       return model.customConnectorName;
     case "DATABRICKS_SQL_WAREHOUSE":
       return model.databricksName;
+    case "TRINO":
+      return model.trinoName;
     case "DOCUMENTS":
       return docTab === "upload" ? model.docUploadName : model.docS3Name;
   }
@@ -789,6 +854,39 @@ function validateStep2(
       t,
     );
     if (roleErr) errs.databricksCrossAccountRoleArn = roleErr;
+  } else if (model.sourceKind === "TRINO") {
+    if (!model.trinoName.trim()) errs.trinoName = t("Name is required.");
+    if (!model.trinoUri.trim())
+      errs.trinoUri = t("Coordinator URI is required.");
+    else if (!TRINO_URI_RE.test(model.trinoUri.trim()))
+      errs.trinoUri = t(
+        "Must be an https host with no path, e.g. https://trino.example.com:443. Plain http is refused.",
+      );
+    if (!model.trinoCatalog.trim())
+      errs.trinoCatalog = t("Catalog is required.");
+    else if (!DATABRICKS_IDENTIFIER_RE.test(model.trinoCatalog.trim()))
+      errs.trinoCatalog = t(
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.",
+      );
+    if (!model.trinoSchemaName.trim())
+      errs.trinoSchemaName = t("Schema is required.");
+    else if (model.trinoSchemaName.includes("."))
+      // A dotted value is a multi-level namespace, which Trino itself rejects
+      // unless nested-namespace-enabled is set. Named separately so the error
+      // explains the limit rather than reading as a typo.
+      errs.trinoSchemaName = t(
+        "One schema per source, and multi-level namespaces are not supported — use a single schema name without dots.",
+      );
+    else if (!DATABRICKS_IDENTIFIER_RE.test(model.trinoSchemaName.trim()))
+      errs.trinoSchemaName = t(
+        "Must be a SQL identifier: a letter or underscore, then letters, digits, or underscores.",
+      );
+    if (!model.trinoSecretArn.trim())
+      errs.trinoSecretArn = t("Credential secret ARN is required.");
+    else if (!SECRET_ARN_RE.test(model.trinoSecretArn.trim()))
+      errs.trinoSecretArn = t(
+        "Must be a Secrets Manager secret ARN: arn:aws:secretsmanager:REGION:ACCOUNT:secret:NAME",
+      );
   } else {
     // DOCUMENTS
     if (docTab === "upload") {
@@ -887,7 +985,8 @@ export const ConnectSource: React.FC = () => {
     model.sourceKind === "GLUE_DATABASE" ||
     model.sourceKind === "JDBC_DATABASE" ||
     model.sourceKind === "CUSTOM_CONNECTOR" ||
-    model.sourceKind === "DATABRICKS_SQL_WAREHOUSE";
+    model.sourceKind === "DATABRICKS_SQL_WAREHOUSE" ||
+    model.sourceKind === "TRINO";
 
   // ── Mutations ──────────────────────────────────────────────────────
   const {
@@ -1065,6 +1164,32 @@ export const ConnectSource: React.FC = () => {
       return;
     }
 
+    if (model.sourceKind === "TRINO") {
+      createSource({
+        namespaceId: namespaceId!,
+        body: {
+          sourceType: SourceType.DATABASE,
+          databaseSource: {
+            name: model.trinoName.trim(),
+            metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
+            // One configuration only: the backend rejects a payload carrying more
+            // than one, since the configuration present selects the sub-type.
+            trinoConfiguration: {
+              uri: model.trinoUri.trim(),
+              catalog: model.trinoCatalog.trim(),
+              schemaName: model.trinoSchemaName.trim(),
+              authMode: model.trinoAuthMode,
+              credentialSecretArn: model.trinoSecretArn.trim(),
+              tableFilter: model.trinoTableFilter.trim() || undefined,
+              tableExcludeFilter:
+                model.trinoTableExcludeFilter.trim() || undefined,
+            },
+          },
+        },
+      });
+      return;
+    }
+
     // DOCUMENTS — s3 mode
     if (docTab === "s3") {
       createSource({
@@ -1201,6 +1326,13 @@ export const ConnectSource: React.FC = () => {
                 label: t(SOURCE_KIND_LABELS.DATABRICKS_SQL_WAREHOUSE),
                 description: t(
                   "Connect one Unity Catalog schema on a Databricks SQL Warehouse. Nothing to deploy — Context Ontology Accelerator operates the connector; you supply the warehouse, the credential secret, and the role that reads it.",
+                ),
+              },
+              {
+                value: "TRINO",
+                label: t(SOURCE_KIND_LABELS.TRINO),
+                description: t(
+                  "Connect one schema on a Trino cluster you operate. The source is the coordinator, so this reaches whatever Trino federates — an Iceberg REST catalog, S3 Tables, Hive metastore, Nessie, or Delta — and aggregates run in Trino rather than through Athena.",
                 ),
               },
               {
@@ -2057,6 +2189,228 @@ export const ConnectSource: React.FC = () => {
           </SpaceBetween>
         ),
       };
+    } else if (model.sourceKind === "TRINO") {
+      step2 = {
+        title: t("Configure connection"),
+        description: t(
+          "Name the coordinator and schema to read, and the credential Context Ontology Accelerator may read them with.",
+        ),
+        errorText: step2Errs.step1,
+        content: (
+          <SpaceBetween size="l">
+            <Container
+              header={<Header variant="h2">{t("Source details")}</Header>}
+            >
+              <FormField
+                label={
+                  <>
+                    {t("Source name")}{" "}
+                    <Box variant="span" color="text-status-error">
+                      *
+                    </Box>
+                  </>
+                }
+                description={t(
+                  "A unique name for this source within the namespace.",
+                )}
+                errorText={step2Errs.trinoName}
+              >
+                <Input
+                  value={model.trinoName}
+                  onChange={({ detail }) => setField("trinoName", detail.value)}
+                  placeholder={t("My Trino Lakehouse")}
+                />
+              </FormField>
+            </Container>
+            <Container
+              header={<Header variant="h2">{t("Coordinator")}</Header>}
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label={
+                    <>
+                      {t("Coordinator URI")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={t(
+                    "The Trino coordinator, https only. Discovery and queries both go here, so the names recorded at scan time are the names queries use.",
+                  )}
+                  constraintText={t(
+                    "The host must be on this deployment's allowlist, and its certificate must be publicly trusted — terminate TLS at a load balancer if the cluster uses a self-signed certificate.",
+                  )}
+                  errorText={step2Errs.trinoUri}
+                >
+                  <Input
+                    value={model.trinoUri}
+                    onChange={({ detail }) =>
+                      setField("trinoUri", detail.value)
+                    }
+                    placeholder="https://trino.example.com:443"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      {t("Catalog")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={t(
+                    "The Trino catalog to read, as configured on the cluster.",
+                  )}
+                  errorText={step2Errs.trinoCatalog}
+                >
+                  <Input
+                    value={model.trinoCatalog}
+                    onChange={({ detail }) =>
+                      setField("trinoCatalog", detail.value)
+                    }
+                    placeholder="iceberg"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      {t("Schema")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={t(
+                    "One schema per source. Add a second source for a second schema.",
+                  )}
+                  constraintText={t(
+                    "Stored lowercase: Trino reports every name in lowercase, so a mixed-case value would match nothing.",
+                  )}
+                  errorText={step2Errs.trinoSchemaName}
+                >
+                  <Input
+                    value={model.trinoSchemaName}
+                    onChange={({ detail }) =>
+                      setField("trinoSchemaName", detail.value)
+                    }
+                    placeholder="sales"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </Container>
+            <Container
+              header={<Header variant="h2">{t("Credential access")}</Header>}
+            >
+              <SpaceBetween size="l">
+                <Alert
+                  type="warning"
+                  header={t(
+                    "Trino's own access control does not apply to these queries",
+                  )}
+                >
+                  {t(
+                    "Context Ontology Accelerator connects with the single service identity in the secret below, so every caller reaches the union of what that identity can read. Trino is often deployed specifically as the authorization layer over a lakehouse, and this route bypasses it — so scope the credential to exactly the catalogs and schemas this namespace should expose. Lake Formation does not govern this route either.",
+                  )}
+                </Alert>
+                <FormField
+                  label={
+                    <>
+                      {t("Authentication mode")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={t(
+                    "How Context Ontology Accelerator authenticates to the coordinator. The secret's shape must match the mode — a secret carrying both shapes is refused rather than guessed.",
+                  )}
+                >
+                  <RadioGroup
+                    value={model.trinoAuthMode}
+                    onChange={({ detail }) => {
+                      if (isTrinoAuthMode(detail.value))
+                        setField("trinoAuthMode", detail.value);
+                    }}
+                    items={TRINO_AUTH_MODE_OPTIONS.map((o) => ({
+                      value: o.value,
+                      label: t(o.label),
+                      description: t(o.description),
+                    }))}
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      {t("Credential secret ARN")}{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description={
+                    model.trinoAuthMode === "BASIC"
+                      ? t(
+                          'AWS Secrets Manager secret in this deployment\'s Region, holding {"username": "…", "password": "…"}.',
+                        )
+                      : t(
+                          'AWS Secrets Manager secret in this deployment\'s Region, holding {"token": "…"}.',
+                        )
+                  }
+                  constraintText={t(
+                    "The secret must carry this deployment's namespace tag listing this namespace — write it with scripts/tag_credential_secrets.py.",
+                  )}
+                  errorText={step2Errs.trinoSecretArn}
+                >
+                  <Input
+                    value={model.trinoSecretArn}
+                    onChange={({ detail }) =>
+                      setField("trinoSecretArn", detail.value)
+                    }
+                    placeholder="arn:aws:secretsmanager:us-east-1:123456789012:secret:trino-abc123"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </Container>
+            <ExpandableSection
+              headerText={t("Advanced configuration")}
+              variant="container"
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label={t("Table filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,.",
+                  )}
+                >
+                  <Input
+                    value={model.trinoTableFilter}
+                    onChange={({ detail }) =>
+                      setField("trinoTableFilter", detail.value)
+                    }
+                    placeholder="orders|customers"
+                  />
+                </FormField>
+                <FormField
+                  label={t("Table exclude filter")}
+                  description={t(
+                    "Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,.",
+                  )}
+                >
+                  <Input
+                    value={model.trinoTableExcludeFilter}
+                    onChange={({ detail }) =>
+                      setField("trinoTableExcludeFilter", detail.value)
+                    }
+                    placeholder="tmp_*|staging_*"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </ExpandableSection>
+          </SpaceBetween>
+        ),
+      };
     } else {
       // DOCUMENTS
       step2 = {
@@ -2641,6 +2995,30 @@ export const ConnectSource: React.FC = () => {
                   {
                     label: t("Table filter"),
                     value: model.databricksTableFilter || t("(none)"),
+                  },
+                ]}
+              />
+            </Container>
+          )}
+          {model.sourceKind === "TRINO" && (
+            <Container header={<Header variant="h2">{t("Connection")}</Header>}>
+              <KeyValuePairs
+                columns={2}
+                items={[
+                  { label: t("Coordinator URI"), value: model.trinoUri },
+                  { label: t("Catalog"), value: model.trinoCatalog },
+                  { label: t("Schema"), value: model.trinoSchemaName },
+                  {
+                    label: t("Authentication mode"),
+                    value: model.trinoAuthMode,
+                  },
+                  {
+                    label: t("Credential secret ARN"),
+                    value: model.trinoSecretArn,
+                  },
+                  {
+                    label: t("Table filter"),
+                    value: model.trinoTableFilter || t("(none)"),
                   },
                 ]}
               />

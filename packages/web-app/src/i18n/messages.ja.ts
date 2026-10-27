@@ -2236,4 +2236,52 @@ export const MESSAGES_JA = {
     "。このデータソースは、その誘導を開始した後に再スキャン・再承認されました。",
   "The pending proposal was built on the older source, so accepting it won't include the re-scan's changes. Re-run the induction on the current source, then accept the new proposal.":
     "保留中の提案は以前のデータソースに基づいているため、承認しても再スキャンの変更は含まれません。現在のデータソースで誘導をやり直し、新しい提案を承認してください。",
+  // Trino source (TRINO). "Catalog" and "schema" here are Trino's own, not
+  // Glue's — the source is the coordinator, not the catalog beneath it.
+  Trino: "Trino",
+  Coordinator: "コーディネーター",
+  "Coordinator URI": "コーディネーター URI",
+  Catalog: "カタログ",
+  Schema: "スキーマ",
+  "Authentication mode": "認証方式",
+  Basic: "Basic",
+  JWT: "JWT",
+  "Username and password, against Trino's password authenticator.":
+    "ユーザー名とパスワードを、Trino のパスワード認証機能に対して使用します。",
+  "A bearer token you mint and rotate.":
+    "お客様が発行・ローテーションするベアラートークンです。",
+  "Connect one schema on a Trino cluster you operate. The source is the coordinator, so this reaches whatever Trino federates — an Iceberg REST catalog, S3 Tables, Hive metastore, Nessie, or Delta — and aggregates run in Trino rather than through Athena.":
+    "お客様が運用する Trino クラスター上のスキーマを 1 つ接続します。データソースはコーディネーターそのものなので、Trino が連携するもの — Iceberg REST カタログ、S3 Tables、Hive メタストア、Nessie、Delta — に到達できます。集計は Athena を経由せず Trino 上で実行されます。",
+  "Name the coordinator and schema to read, and the credential Context Ontology Accelerator may read them with.":
+    "読み取り対象のコーディネーターとスキーマ、および Context Ontology Accelerator がそれらを読み取るための認証情報を指定します。",
+  "My Trino Lakehouse": "My Trino Lakehouse",
+  "The Trino coordinator, https only. Discovery and queries both go here, so the names recorded at scan time are the names queries use.":
+    "Trino のコーディネーターです。https のみ対応します。検出とクエリの両方がここに送られるため、スキャン時に記録された名前がそのままクエリで使われます。",
+  "The host must be on this deployment's allowlist, and its certificate must be publicly trusted — terminate TLS at a load balancer if the cluster uses a self-signed certificate.":
+    "ホストはこのデプロイの許可リストに含まれている必要があり、証明書は公的に信頼されたものである必要があります。クラスターが自己署名証明書を使用している場合は、ロードバランサーで TLS を終端してください。",
+  "The Trino catalog to read, as configured on the cluster.":
+    "読み取り対象の Trino カタログです。クラスター上で設定されている名前を指定します。",
+  "One schema per source. Add a second source for a second schema.":
+    "1 つのデータソースにスキーマは 1 つです。2 つ目のスキーマには、データソースをもう 1 つ追加してください。",
+  "Stored lowercase: Trino reports every name in lowercase, so a mixed-case value would match nothing.":
+    "小文字で保存されます。Trino はすべての名前を小文字で返すため、大文字を含む値では何も一致しません。",
+  "Trino's own access control does not apply to these queries":
+    "これらのクエリに Trino 自身のアクセス制御は適用されません",
+  "Context Ontology Accelerator connects with the single service identity in the secret below, so every caller reaches the union of what that identity can read. Trino is often deployed specifically as the authorization layer over a lakehouse, and this route bypasses it — so scope the credential to exactly the catalogs and schemas this namespace should expose. Lake Formation does not govern this route either.":
+    "Context Ontology Accelerator は下記シークレットの単一のサービス ID で接続するため、すべての呼び出し元がその ID が読み取れる範囲の総和に到達します。Trino はレイクハウス上の認可レイヤーとして導入されることが多く、この経路はそれをバイパスします。したがって、認証情報はこの名前空間が公開すべきカタログとスキーマだけに限定してください。この経路は Lake Formation の統制対象にもなりません。",
+  "How Context Ontology Accelerator authenticates to the coordinator. The secret's shape must match the mode — a secret carrying both shapes is refused rather than guessed.":
+    "Context Ontology Accelerator がコーディネーターに対して認証する方式です。シークレットの形は方式と一致していなければなりません。両方の形を含むシークレットは、推測されるのではなく拒否されます。",
+  'AWS Secrets Manager secret in this deployment\'s Region, holding {"username": "…", "password": "…"}.':
+    'このデプロイのリージョンにある AWS Secrets Manager シークレットで、{"username": "…", "password": "…"} を保持します。',
+  'AWS Secrets Manager secret in this deployment\'s Region, holding {"token": "…"}.':
+    'このデプロイのリージョンにある AWS Secrets Manager シークレットで、{"token": "…"} を保持します。',
+  "The secret must carry this deployment's namespace tag listing this namespace — write it with scripts/tag_credential_secrets.py.":
+    "シークレットには、この名前空間を列挙したこのデプロイの名前空間タグが付いている必要があります。scripts/tag_credential_secrets.py で付与してください。",
+  "Coordinator URI is required.": "コーディネーター URI は必須です。",
+  "Must be an https host with no path, e.g. https://trino.example.com:443. Plain http is refused.":
+    "パスを含まない https のホストを指定してください（例: https://trino.example.com:443）。平文の http は拒否されます。",
+  "Catalog is required.": "カタログは必須です。",
+  "Schema is required.": "スキーマは必須です。",
+  "One schema per source, and multi-level namespaces are not supported — use a single schema name without dots.":
+    "1 つのデータソースにスキーマは 1 つで、多階層の名前空間はサポートされません。ドットを含まない単一のスキーマ名を指定してください。",
 } as const;
