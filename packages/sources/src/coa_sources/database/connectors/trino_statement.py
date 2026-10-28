@@ -186,6 +186,17 @@ class TrinoConfigError(TrinoStatementError):
     """
 
 
+def quote_literal(value: str) -> str:
+    """Return ``value`` as a single-quoted Trino string literal.
+
+    The literal-position counterpart to :func:`quote_ident`. Needed because a
+    name that is legal as an identifier may still carry a ``'``, and a name is
+    sometimes carried as data — a label in a result column, say — where it is no
+    longer in an identifier position and doubling ``"`` protects nothing.
+    """
+    return "'" + value.replace("'", "''") + "'"
+
+
 def quote_ident(name: str) -> str:
     """Return ``name`` as a double-quoted Trino identifier.
 

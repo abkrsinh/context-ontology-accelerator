@@ -695,6 +695,13 @@ export class SourcesStack extends SCLStack {
         // Read by the Trino connector, which re-guards the coordinator URI on every
         // scan: an allowlisted host can be re-pointed after the source exists.
         TRINO_ALLOWED_HOSTS: trinoAllowedHostsCsv,
+        // Off by default because these two queries read table DATA, which the
+        // metadata queries never do. On, Tier-2 gets the literals it needs to
+        // match categorical values it would otherwise have to guess.
+        TRINO_SAMPLE_DISTINCT_VALUES: String(
+          this.node.tryGetContext("trino_sample_distinct_values") === "true" ||
+            this.node.tryGetContext("trino_sample_distinct_values") === true,
+        ),
       },
     });
 

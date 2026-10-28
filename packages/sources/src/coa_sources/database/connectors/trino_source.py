@@ -132,6 +132,38 @@ def _allowed_hosts() -> tuple[str, ...]:
     return tuple(h.strip() for h in os.environ.get("TRINO_ALLOWED_HOSTS", "").split(",") if h.strip())
 
 
+def _sampling_bounds() -> tuple[int, int]:
+    """Cardinality ceiling and per-statement column ceiling for sampling.
+
+    Read per scan, like the enable flag, so a change lands on the next scan
+    rather than the next cold start. A malformed value falls back to the default
+    rather than disabling the bound it exists to enforce.
+    """
+    from .dialects import MAX_ENUM_DISTINCT  # noqa: PLC0415 - optional path
+    from .trino_sampler import MAX_COLUMNS_PER_QUERY  # noqa: PLC0415 - optional path
+
+    def _read(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, "") or default)
+        except ValueError:
+            logger.warning("trino_sampling_bound_unreadable", var=name, value=os.environ.get(name))
+            return default
+        return value if value > 0 else default
+
+    return _read("TRINO_SAMPLE_MAX_DISTINCT", MAX_ENUM_DISTINCT), _read(
+        "TRINO_SAMPLE_MAX_COLUMNS_PER_QUERY", MAX_COLUMNS_PER_QUERY
+    )
+
+
+def _sampling_enabled() -> bool:
+    """Whether to sample categorical values for literal matching.
+
+    Read per scan rather than at import so the flag takes effect on the next
+    scan instead of the next Lambda cold start.
+    """
+    return os.environ.get("TRINO_SAMPLE_DISTINCT_VALUES", "").strip().lower() == "true"
+
+
 def _fetch_secret(secret_arn: str, region: str) -> dict:
     """Read the credential secret, as JdbcConnector does for its own.
 
@@ -312,6 +344,8 @@ class TrinoConnector:
                 continue
             tables.append(self._build_table(resolved, name, parsed, config))
 
+        self._sample_distinct_values(tables, runner, catalog=catalog, schema=resolved, config=config)
+
         emit_metric("TrinoTablesDiscovered", len(tables), "Count")
         if failed:
             emit_metric("TrinoTablesFailed", len(failed), "Count")
@@ -323,6 +357,44 @@ class TrinoConnector:
             failed=len(failed),
         )
         return DiscoveredMetadata(tables=tables, failed_tables=sorted(failed), filter_warnings=filter_warnings)
+
+    def _sample_distinct_values(
+        self,
+        tables: list[Table],
+        runner: TrinoStatementRunner,
+        *,
+        catalog: str,
+        schema: str,
+        config: dict,
+    ) -> None:
+        """Attach enum-like values to categorical columns, in place.
+
+        Gated off by default at the deployment level rather than per source: the
+        two queries read table data, which the metadata queries never do.
+        """
+        if not tables or not _sampling_enabled():
+            return
+        from .trino_sampler import TrinoSampler  # noqa: PLC0415 - optional path
+
+        max_distinct, max_columns = _sampling_bounds()
+        sampler = TrinoSampler(runner, max_distinct=max_distinct, max_columns_per_query=max_columns)
+        sampled = sampler.sample_all(
+            [(t.name, [(c.name, c.data_type) for c in t.columns]) for t in tables],
+            catalog=catalog,
+            schema=schema,
+            timeout_seconds=config.get("timeout_seconds"),
+        )
+        if not sampled:
+            return
+        total = 0
+        for table in tables:
+            for col in table.columns:
+                values = sampled.get(table.name, {}).get(col.name)
+                if values:
+                    col.distinct_values = values
+                    total += 1
+        emit_metric("TrinoColumnsSampled", total, "Count")
+        logger.info("trino_sampling_complete", catalog=catalog, schema=schema, columns_sampled=total)
 
     # ── Internals ────────────────────────────────────────────────────────────
 

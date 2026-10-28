@@ -24,6 +24,7 @@ which is what makes the ``SELECT *`` guard possible.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from typing import Any
 from unittest.mock import patch
@@ -558,3 +559,84 @@ def test_a_glob_that_legitimately_matches_nothing_stays_silent() -> None:
 def test_no_filters_means_no_warnings() -> None:
     runner = FakeRunner(tables=[["orders"]], columns=[_col("orders", "id")])
     assert _connector(runner).discover_metadata(dict(_CONFIG)).filter_warnings == []
+
+
+# ── Categorical sampling (opt-in) ────────────────────────────────────────────
+
+
+class _SamplingRunner(FakeRunner):
+    """FakeRunner that also answers the sampler's two passes.
+
+    The base double routes anything unrecognised to ``ping``, which the sampler
+    would read as an unparseable row — so the sampling statements need their own
+    arm to be exercised at all.
+    """
+
+    def __init__(self, *, ndv: dict, values: dict, fail: bool = False, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._ndv = ndv
+        self._values = values
+        self._fail = fail
+
+    def run(self, statement: str, **kwargs: Any) -> list[list[str | None]]:
+        if "approx_distinct" in statement or "array_agg" in statement:
+            self.calls.append({"sql": statement, **kwargs})
+            if self._fail:
+                raise RuntimeError("sampling query failed")
+            payload = self._ndv if "approx_distinct" in statement else self._values
+            return [[t, json.dumps(cols)] for t, cols in payload.items()]
+        return super().run(statement, **kwargs)
+
+    def sampling_statements(self) -> list[str]:
+        return [s for s in self.statements if "approx_distinct" in s or "array_agg" in s]
+
+
+def _sampling_runner(**kwargs: Any) -> _SamplingRunner:
+    return _SamplingRunner(
+        tables=[["orders"]],
+        columns=[_col("orders", "status", "varchar"), _col("orders", "total", "decimal(18,2)")],
+        **kwargs,
+    )
+
+
+def test_sampling_is_off_unless_enabled() -> None:
+    """Reading table data is opt-in: the metadata queries never do it."""
+    runner = _sampling_runner(ndv={}, values={})
+    with patch.dict(os.environ, {"TRINO_SAMPLE_DISTINCT_VALUES": ""}, clear=False):
+        result = _connector(runner).discover_metadata(dict(_CONFIG))
+    assert runner.sampling_statements() == []
+    assert len(runner.discovery_statements()) == 2
+    assert result.tables[0].columns[0].distinct_values == []
+
+
+def test_sampling_adds_two_statements_and_populates_distinct_values() -> None:
+    runner = _sampling_runner(
+        ndv={"orders": {"status": 3}},
+        values={"orders": {"status": ["F", "O", "P"]}},
+    )
+    with patch.dict(os.environ, {"TRINO_SAMPLE_DISTINCT_VALUES": "true"}, clear=False):
+        result = _connector(runner).discover_metadata(dict(_CONFIG))
+    assert len(runner.sampling_statements()) == 2
+    status = next(c for c in result.tables[0].columns if c.name == "status")
+    assert status.distinct_values == ["F", "O", "P"]
+
+
+def test_sampling_leaves_non_string_columns_alone() -> None:
+    runner = _sampling_runner(
+        ndv={"orders": {"status": 3}},
+        values={"orders": {"status": ["F"]}},
+    )
+    with patch.dict(os.environ, {"TRINO_SAMPLE_DISTINCT_VALUES": "true"}, clear=False):
+        result = _connector(runner).discover_metadata(dict(_CONFIG))
+    total = next(c for c in result.tables[0].columns if c.name == "total")
+    assert total.distinct_values == []
+    assert "total" not in runner.sampling_statements()[0]
+
+
+def test_a_sampling_failure_does_not_fail_the_scan() -> None:
+    """Sampling improves literal matching; it must never cost the discovery."""
+    runner = _sampling_runner(ndv={}, values={}, fail=True)
+    with patch.dict(os.environ, {"TRINO_SAMPLE_DISTINCT_VALUES": "true"}, clear=False):
+        result = _connector(runner).discover_metadata(dict(_CONFIG))
+    assert [t.name for t in result.tables] == ["orders"]
+    assert result.tables[0].columns[0].distinct_values == []
