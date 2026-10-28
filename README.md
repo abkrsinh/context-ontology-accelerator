@@ -2,7 +2,7 @@
 
 An open-source semantic context layer for AWS that combines knowledge graphs, formal ontologies, and rule-based systems with modern AI — enabling agents to retrieve context, validate it against business logic, and determine correct actions.
 
-> **Branch `trino-source`: work in progress, based on `v0.3.7`.**
+> **Branch `trino-source`: based on `v0.3.7`.**
 >
 > Adds Trino as a data source (`SourceSubType.TRINO`), so a lakehouse reached through Trino (Iceberg REST, Hive metastore, Nessie, Delta) can be onboarded without mirroring into Glue or operating an Athena federation Lambda. Discovery reads the coordinator's `information_schema` in two queries per source, plus two more when categorical sampling is on; serve-time SQL executes on that same coordinator, so discovered identifiers are the queryable ones.
 >
