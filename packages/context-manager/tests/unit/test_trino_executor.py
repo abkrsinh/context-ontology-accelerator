@@ -226,6 +226,49 @@ async def test_a_rejected_query_does_not_trip_the_breaker() -> None:
         assert (await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)).row_count == 1
 
 
+async def test_one_failed_probe_reopens_the_breaker() -> None:
+    """A still-down coordinator costs one query per window, not the threshold.
+
+    Clearing the failure list on half-open instead would let the full threshold
+    of real Tier-2 queries pay the Trino timeout after every open window.
+    """
+    ex = _executor()
+    with patch(f"{_MODULE}._BREAKER_THRESHOLD", 3), patch(f"{_MODULE}._BREAKER_OPEN_S", 0):
+        await _fail_n_times(ex, 3, TrinoUnavailableError("down"))
+        await _fail_n_times(ex, 1, TrinoUnavailableError("still down"))
+        with patch(f"{_MODULE}._BREAKER_OPEN_S", 30), pytest.raises(TrinoUnavailableError, match="breaker open"):
+            await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+
+
+async def test_a_successful_probe_closes_the_breaker() -> None:
+    ex = _executor()
+    with patch(f"{_MODULE}._BREAKER_THRESHOLD", 3), patch(f"{_MODULE}._BREAKER_OPEN_S", 0):
+        await _fail_n_times(ex, 3, TrinoUnavailableError("down"))
+        with (
+            _reachable(),
+            patch.object(TrinoQueryExecutor, "_run", staticmethod(_fake_run([{"a": 1}]))),
+        ):
+            assert (await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)).row_count == 1
+            assert (await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)).row_count == 1
+
+
+async def test_a_guard_rejection_feeds_the_breaker() -> None:
+    """An SSRF rejection is an unavailability like any other, so it is counted."""
+    ex = _executor()
+    with (
+        patch(f"{_MODULE}._BREAKER_THRESHOLD", 2),
+        # Empty allowlist plus a private answer: refused by the reachability gate
+        # rather than by whether this machine can resolve the host.
+        patch(f"{_MODULE}._ALLOWED_HOSTS", ()),
+        patch("coa_common.net.url_guard.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 0))]),
+    ):
+        for _ in range(2):
+            with pytest.raises(TrinoUnavailableError):
+                await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+        with pytest.raises(TrinoUnavailableError, match="breaker open"):
+            await ex.execute("SELECT a FROM t", namespace=_NS, data_source_id=_SRC)
+
+
 async def test_the_breaker_is_scoped_per_namespace() -> None:
     """One unreachable coordinator must not suppress Tier 2 for everyone."""
     ex = _executor()

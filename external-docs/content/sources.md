@@ -96,15 +96,18 @@ low-cardinality text columns so natural-language questions can match them.
 Worth enabling when questions filter on categorical values, because without it the model
 has to guess how a value is spelled and cased in your data — and a wrong guess yields a
 query that is valid, runs, and returns nothing, with no error to explain why. The cost is
-two full scans of the sampled columns per scan of the source, bounded only by the statement
-timeout, on your cluster.
+two queries per scan of the source, each reading at most `PROBE_MAX_ROWS` rows per table
+(100,000 by default) regardless of how large the table is, on your cluster.
 
-Two things to know before turning it on:
+Three things to know before turning it on:
 
 - It takes effect on the **next scan**, and the values only reach question-answering after a
   **re-induction** — so an existing source needs both.
-- Only columns below a distinct-value threshold are collected, so free-text columns are
-  probed and then skipped rather than pulled in wholesale.
+- Only columns below a distinct-value threshold, and whose values actually repeat, are
+  collected — so free-text columns and unique identifiers are probed and then skipped rather
+  than pulled in wholesale.
+- Values come from the capped prefix, not the whole table, so a value rarer than the cap may
+  be missed. 
 
 Identifiers (`catalog`, `schemaName`, and both table filters) are lowercased at registration,
 because Trino reports every name in lowercase — a filter of `ORDERS` would otherwise silently

@@ -114,6 +114,9 @@ class _BreakerState:
 
     failures: list[float] = field(default_factory=list)
     opened_at: float = 0.0
+    # Set while the single post-open probe is outstanding, so its failure
+    # re-opens immediately instead of spending the threshold again.
+    half_open: bool = False
 
 
 def _auth_from_secret(auth_mode: str, secret: dict[str, Any]) -> tuple[Any, str]:
@@ -215,7 +218,15 @@ class TrinoQueryExecutor:
         _firewall.validate(sql)
         self._check_breaker(namespace)
 
-        config = await self._resolve_config(namespace, data_source_id)
+        # A URI that no longer passes the guard is an unavailability like any
+        # other, so it is metered and fed to the breaker rather than raising past
+        # both because it happens before the execute.
+        try:
+            config = await self._resolve_config(namespace, data_source_id)
+        except TrinoUnavailableError:
+            emit_metric(_METRICS_NAMESPACE, "TrinoQueryFailures", 1, "Count", FailureClass="unavailable")
+            self._record_failure(namespace)
+            raise
         statement = self._inject_limit(sql, min(max_rows, self._max_rows))
 
         try:
@@ -297,6 +308,10 @@ class TrinoQueryExecutor:
 
         response = self._secrets.get_secret_value(SecretId=secret_arn)
         secret = json.loads(response["SecretString"])
+        # A JSON scalar or array parses fine and then fails as an AttributeError
+        # on the first `.get`, which reads as a bug here rather than a bad secret.
+        if not isinstance(secret, dict):
+            raise TrinoQueryError("Trino credential secret must be a JSON object")
 
         with self._secret_lock:
             self._secret_cache[secret_arn] = (secret, time.monotonic())
@@ -401,17 +416,19 @@ class TrinoQueryExecutor:
                 f"Trino is unavailable for namespace {namespace}; retrying in "
                 f"{_BREAKER_OPEN_S:g}s (circuit breaker open)"
             )
-        # Half-open: one probe decides.
+        # Half-open: one probe decides. Clearing `failures` as well would cost
+        # the full threshold in real queries to re-open after every window.
         state.opened_at = 0.0
-        state.failures.clear()
+        state.half_open = True
 
     def _record_failure(self, namespace: str) -> None:
         state = self._breakers[namespace]
         now = time.monotonic()
         state.failures = [t for t in state.failures if now - t < _BREAKER_WINDOW_S]
         state.failures.append(now)
-        if len(state.failures) >= _BREAKER_THRESHOLD:
+        if state.half_open or len(state.failures) >= _BREAKER_THRESHOLD:
             state.opened_at = now
+            state.half_open = False
             emit_metric(_METRICS_NAMESPACE, "TrinoCircuitBreakerOpen", 1, "Count")
             logger.warning("trino_circuit_breaker_open", namespace=namespace, failures=len(state.failures))
 
@@ -419,3 +436,4 @@ class TrinoQueryExecutor:
         state = self._breakers[namespace]
         state.failures.clear()
         state.opened_at = 0.0
+        state.half_open = False

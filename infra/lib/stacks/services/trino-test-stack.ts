@@ -156,6 +156,9 @@ export class TrinoTestStack extends SCLStack {
       "dnf install -y docker httpd-tools jq",
       "systemctl enable --now docker",
       "mkdir -p /etc/trino/catalog",
+      // `set -x` expands the shared secret and the password below into
+      // cloud-init's log, which GetConsoleOutput returns.
+      "set +x",
       // TLS terminates at the ALB, so Trino serves plain HTTP. Password auth over
       // HTTP requires process-forwarded, and is safe only because 8080 admits the
       // ALB's SG alone.
@@ -206,13 +209,12 @@ tpch.splits-per-node=4
 CFG`,
           ]
         : []),
-      // Tracing off across these two: `set -eux` would otherwise expand the
-      // password into cloud-init's log, readable via GetConsoleOutput.
-      "set +x",
       `PW=$(aws secretsmanager get-secret-value --region ${this.region} --secret-id ${this.credentialSecret.secretArn} --query SecretString --output text | jq -r .password)`,
       'htpasswd -bBC 10 -c /etc/trino/password.db coa "$PW"',
       "unset PW",
       "set -x",
+      // Published on all interfaces because the ALB health-checks the instance's
+      // private IP; 8080 admits the ALB's SG alone.
       "docker run -d --restart=always --name trino -p 8080:8080 -v /etc/trino:/etc/trino trinodb/trino:484",
     );
 

@@ -57,6 +57,31 @@ def test_punycode_is_left_to_the_gates() -> None:
         assert validate_url("https://xn--trno-5qa.example.com", require_global=True).hostname.startswith("xn--")
 
 
+# ── Port ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("url", ["https://trino.example.com:99999", "https://trino.example.com:65536"])
+def test_rejects_out_of_range_port_as_a_guard_error(url: str) -> None:
+    """The model's `\\d{1,5}` admits these, so the guard is what refuses them.
+
+    As UrlGuardError specifically: callers catch only that, so a bare ValueError
+    would surface as a 500 rather than a 400.
+    """
+    with _resolves_to("93.184.216.34"), pytest.raises(UrlGuardError, match="port"):
+        validate_url(url, require_global=True)
+
+
+def test_rejects_port_zero_rather_than_defaulting_it() -> None:
+    with _resolves_to("93.184.216.34"), pytest.raises(UrlGuardError, match="port"):
+        validate_url("https://trino.example.com:0", require_global=True)
+
+
+@pytest.mark.parametrize(("url", "expected"), [("https://x.example.com", 443), ("https://x.example.com:8443", 8443)])
+def test_port_defaults_to_443_when_absent(url: str, expected: int) -> None:
+    with _resolves_to("93.184.216.34"):
+        assert validate_url(url, require_global=True).port == expected
+
+
 # ── Hard-deny classes ────────────────────────────────────────────────────────
 
 

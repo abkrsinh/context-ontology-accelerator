@@ -31,6 +31,7 @@ from unittest.mock import patch
 
 import pytest
 from coa_common.domain_models import EnrichmentSource
+from coa_sources.database.connectors.dialects import MIN_REPETITION_FACTOR
 from coa_sources.database.connectors.trino_source import (
     SchemaNotFoundError,
     TrinoConnector,
@@ -583,8 +584,15 @@ class _SamplingRunner(FakeRunner):
             self.calls.append({"sql": statement, **kwargs})
             if self._fail:
                 raise RuntimeError("sampling query failed")
-            payload = self._ndv if "approx_distinct" in statement else self._values
-            return [[t, json.dumps(cols)] for t, cols in payload.items()]
+            if "approx_distinct" in statement:
+                # Probe rows carry a third cell, the per-column non-null count.
+                # Set to the repetition gate's threshold so these fixtures stay
+                # about cardinality.
+                return [
+                    [t, json.dumps(cols), json.dumps({c: int(d) * MIN_REPETITION_FACTOR for c, d in cols.items()})]
+                    for t, cols in self._ndv.items()
+                ]
+            return [[t, json.dumps(cols)] for t, cols in self._values.items()]
         return super().run(statement, **kwargs)
 
     def sampling_statements(self) -> list[str]:

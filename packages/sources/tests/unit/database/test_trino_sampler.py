@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from coa_sources.database.connectors.dialects import MIN_REPETITION_FACTOR
 from coa_sources.database.connectors.trino_sampler import TrinoSampler, is_sampleable_type
 from coa_sources.database.connectors.trino_statement import quote_ident, quote_literal
 
@@ -47,7 +48,22 @@ class _Runner:
 
 
 def _json_rows(payload: dict[str, dict]) -> list[list[str]]:
+    """Rows for the COLLECT pass: ``(table, values_map)``."""
     return [[table, json.dumps(cols)] for table, cols in payload.items()]
+
+
+def _probe_rows(distincts: dict[str, dict], totals: dict[str, dict] | None = None) -> list[list[str]]:
+    """Rows for the PROBE pass: ``(table, distinct_map, non_null_map)``.
+
+    Non-null counts default to exactly ``MIN_REPETITION_FACTOR x distinct`` so a
+    fixture that only cares about cardinality sits on the repetition gate's
+    inclusive boundary rather than having to restate it.
+    """
+    rows = []
+    for table, cols in distincts.items():
+        counts = (totals or {}).get(table) or {c: int(d) * MIN_REPETITION_FACTOR for c, d in cols.items()}
+        rows.append([table, json.dumps(cols), json.dumps(counts)])
+    return rows
 
 
 _ORDERS = ("orders", [("status", "varchar(10)"), ("note", "varchar"), ("total", "decimal(18,2)")])
@@ -94,7 +110,7 @@ def test_sampling_adds_two_queries_not_per_column() -> None:
     cols = [(f"c{i}", "varchar") for i in range(40)]
     runner = _Runner(
         [
-            _json_rows({"wide": {f"c{i}": 3 for i in range(40)}}),
+            _probe_rows({"wide": {f"c{i}": 3 for i in range(40)}}),
             _json_rows({"wide": {f"c{i}": ["A", "B", "C"] for i in range(40)}}),
         ]
     )
@@ -107,7 +123,7 @@ def test_many_tables_share_one_statement_per_pass() -> None:
     tables = [(f"t{i}", [("status", "varchar")]) for i in range(10)]
     runner = _Runner(
         [
-            _json_rows({f"t{i}": {"status": 2} for i in range(10)}),
+            _probe_rows({f"t{i}": {"status": 2} for i in range(10)}),
             _json_rows({f"t{i}": {"status": ["N", "Y"]} for i in range(10)}),
         ]
     )
@@ -119,7 +135,7 @@ def test_many_tables_share_one_statement_per_pass() -> None:
 def test_candidates_are_chunked_past_the_ceiling() -> None:
     """A wide schema becomes a few bounded statements, never one unbounded one."""
     cols = [(f"c{i}", "varchar") for i in range(10)]
-    runner = _Runner([_json_rows({"t": {}})] * 10)
+    runner = _Runner([_probe_rows({"t": {}})] * 10)
     TrinoSampler(runner, max_columns_per_query=4).sample_all([("t", cols)], catalog="c", schema="s")
     # 10 candidates at 4 per statement → 3 chunks; the cardinality pass of each
     # returns nothing sampleable, so only the first pass runs per chunk.
@@ -136,7 +152,7 @@ def test_high_cardinality_column_is_not_collected() -> None:
     column — the failure mode the two-pass split exists to prevent."""
     runner = _Runner(
         [
-            _json_rows({"orders": {"status": 3, "note": 995}}),
+            _probe_rows({"orders": {"status": 3, "note": 995}}),
             _json_rows({"orders": {"status": ["F", "O", "P"]}}),
         ]
     )
@@ -148,7 +164,7 @@ def test_high_cardinality_column_is_not_collected() -> None:
 
 def test_a_zero_cardinality_column_is_skipped() -> None:
     """An empty column has nothing to match on, so collecting it is wasted work."""
-    runner = _Runner([_json_rows({"orders": {"status": 0, "note": 0}})])
+    runner = _Runner([_probe_rows({"orders": {"status": 0, "note": 0}})])
     out = TrinoSampler(runner).sample_all([_ORDERS], catalog="c", schema="s")
     assert out == {}
     assert len(runner.statements) == 1
@@ -157,7 +173,7 @@ def test_a_zero_cardinality_column_is_skipped() -> None:
 def test_the_threshold_is_inclusive() -> None:
     runner = _Runner(
         [
-            _json_rows({"orders": {"status": 25}}),
+            _probe_rows({"orders": {"status": 25}}),
             _json_rows({"orders": {"status": ["a"]}}),
         ]
     )
@@ -165,6 +181,127 @@ def test_the_threshold_is_inclusive() -> None:
         [("orders", [("status", "varchar")])], catalog="c", schema="s"
     )
     assert out["orders"]["status"] == ["a"]
+
+
+# ── The repetition gate ──────────────────────────────────────────────────
+
+
+def test_a_unique_identifier_column_is_not_collected() -> None:
+    """The case a distinct ceiling alone admits: a table smaller than the ceiling.
+
+    25 rows of 25 distinct order ids pass `distinct <= 25`, and without the
+    repetition factor they reach the Tier-2 prompt as `allowed values` — telling
+    the model those ids are the column's categories.
+    """
+    runner = _Runner([_probe_rows({"orders": {"id": 25}}, {"orders": {"id": 25}})])
+    out = TrinoSampler(runner).sample_all([("orders", [("id", "varchar")])], catalog="c", schema="s")
+    assert out == {}
+    assert len(runner.statements) == 1
+
+
+def test_the_repetition_factor_is_inclusive() -> None:
+    runner = _Runner(
+        [
+            _probe_rows({"orders": {"status": 3}}, {"orders": {"status": 3 * MIN_REPETITION_FACTOR}}),
+            _json_rows({"orders": {"status": ["F", "O", "P"]}}),
+        ]
+    )
+    out = TrinoSampler(runner).sample_all([("orders", [("status", "varchar")])], catalog="c", schema="s")
+    assert out == {"orders": {"status": ["F", "O", "P"]}}
+
+
+def test_a_mostly_null_column_is_judged_on_its_own_non_null_rows() -> None:
+    """Why the probe counts `count(col)` and not `count(*)`.
+
+    A column with 3 distinct values in 4 non-null rows is not repetitive, however
+    many rows the table has.
+    """
+    runner = _Runner([_probe_rows({"orders": {"status": 3}}, {"orders": {"status": 4}})])
+    out = TrinoSampler(runner).sample_all([("orders", [("status", "varchar")])], catalog="c", schema="s")
+    assert out == {}
+
+
+def test_the_probe_counts_non_nulls_per_column() -> None:
+    runner = _Runner([_probe_rows({"orders": {"status": 2}})])
+    TrinoSampler(runner).sample_all([("orders", [("status", "varchar")])], catalog="c", schema="s")
+    assert 'count("status")' in runner.statements[0]
+    assert "count(*)" not in runner.statements[0]
+
+
+def test_an_unreadable_count_leaves_the_column_unsampled() -> None:
+    """Zero fails the gate, so a count nobody could parse is not collected on."""
+    runner = _Runner([[["orders", json.dumps({"status": 2}), json.dumps({"status": "nope"})]]])
+    out = TrinoSampler(runner).sample_all([("orders", [("status", "varchar")])], catalog="c", schema="s")
+    assert out == {}
+
+
+# ── The row cap ──────────────────────────────────────────────────────────
+
+
+def test_both_passes_read_a_capped_prefix() -> None:
+    """Without the cap, two full scans of a fact table buy 25 values.
+
+    Both passes carry it, and the same one: if the probe measured a prefix and the
+    collection scanned the whole table, the values could be ones the gate never
+    saw — and the scan the cap exists to prevent would happen anyway.
+    """
+    runner = _Runner(
+        [
+            _probe_rows({"lineitem": {"status": 3}}),
+            _json_rows({"lineitem": {"status": ["F", "O", "P"]}}),
+        ]
+    )
+    TrinoSampler(runner, row_cap=1000).sample_all([("lineitem", [("status", "varchar")])], catalog="c", schema="s")
+    assert len(runner.statements) == 2
+    for stmt in runner.statements:
+        assert "LIMIT 1000" in stmt
+        assert 'FROM "lineitem"' in stmt
+
+
+def test_one_scan_serves_every_column_of_a_table() -> None:
+    """The efficiency this sampler trades the fan-out for: N aggregates, 1 scan."""
+    runner = _Runner([_probe_rows({"t": {"a": 2, "b": 2, "c": 2}})])
+    TrinoSampler(runner).sample_all(
+        [("t", [("a", "varchar"), ("b", "varchar"), ("c", "varchar")])], catalog="c", schema="s"
+    )
+    assert runner.statements[0].count('FROM "t"') == 1
+    assert runner.statements[0].count("approx_distinct") == 3
+
+
+# ── The value-shape backstop ─────────────────────────────────────────────
+
+
+def test_low_cardinality_free_text_is_rejected() -> None:
+    """Cardinality alone cannot tell a category from a sentence."""
+    prose = [
+        "The order was returned by the customer after a delay in shipping",
+        "Customer reported the item arrived damaged and requested a refund",
+        "Shipment was delayed in transit and the customer cancelled the order",
+    ]
+    runner = _Runner([_probe_rows({"orders": {"note": 3}}), _json_rows({"orders": {"note": prose}})])
+    out = TrinoSampler(runner).sample_all([("orders", [("note", "varchar")])], catalog="c", schema="s")
+    assert out == {}
+
+
+def test_a_long_value_is_truncated() -> None:
+    """One junk row in an otherwise clean category column.
+
+    The set still passes the shape check on average, so the column is kept — and
+    the cap is what stops that one value contributing 400 chars to the prompt. A
+    set whose *average* is long is rejected outright instead; truncation does not
+    rescue it.
+    """
+    values = ["A" * 400, *[f"C{i}" for i in range(9)]]
+    runner = _Runner([_probe_rows({"t": {"code": 10}}), _json_rows({"t": {"code": values}})])
+    out = TrinoSampler(runner).sample_all([("t", [("code", "varchar")])], catalog="c", schema="s")
+    assert max(len(v) for v in out["t"]["code"]) == 100
+    assert len(out["t"]["code"]) == 10
+
+
+def test_empty_strings_are_dropped() -> None:
+    runner = _Runner([_probe_rows({"t": {"c": 3}}), _json_rows({"t": {"c": ["F", "", "O"]}})])
+    out = TrinoSampler(runner).sample_all([("t", [("c", "varchar")])], catalog="c", schema="s")
+    assert out["t"]["c"] == ["F", "O"]
 
 
 # ── Values reach the caller unchanged ────────────────────────────────────
@@ -175,7 +312,7 @@ def test_values_are_preserved_verbatim() -> None:
     data actually stores."""
     runner = _Runner(
         [
-            _json_rows({"nation": {"name": 3}}),
+            _probe_rows({"nation": {"name": 3}}),
             _json_rows({"nation": {"name": ["FRANCE", "SAUDI ARABIA", "United Kingdom"]}}),
         ]
     )
@@ -186,7 +323,7 @@ def test_values_are_preserved_verbatim() -> None:
 def test_nulls_are_dropped_from_the_values() -> None:
     runner = _Runner(
         [
-            _json_rows({"orders": {"status": 3}}),
+            _probe_rows({"orders": {"status": 3}}),
             _json_rows({"orders": {"status": ["F", None, "O"]}}),
         ]
     )
@@ -204,14 +341,14 @@ def test_a_sampling_failure_returns_empty_rather_than_raising() -> None:
 
 
 def test_an_unparseable_row_is_skipped_not_fatal() -> None:
-    runner = _Runner([[["orders", "not json"]]])
+    runner = _Runner([[["orders", "not json", "not json"]]])
     assert TrinoSampler(runner).sample_all([_ORDERS], catalog="c", schema="s") == {}
 
 
 def test_identifiers_are_quoted_in_the_emitted_sql() -> None:
     """A column named like a keyword, or carrying a quote, must not break out of
     its identifier position."""
-    runner = _Runner([_json_rows({"t": {}})])
+    runner = _Runner([_probe_rows({"t": {}})])
     TrinoSampler(runner).sample_all([("t", [('we"ird', "varchar")])], catalog="c", schema="s")
     assert '"we""ird"' in runner.statements[0]
 
@@ -229,7 +366,7 @@ def test_an_apostrophe_in_a_name_does_not_break_the_statement(table: str, column
     where doubling `"` protects nothing. A legal name carrying `'` previously
     produced a syntax error, and `sample_all` swallows it, so sampling was lost
     for the whole chunk with nothing surfaced."""
-    runner = _Runner([_json_rows({table: {}})])
+    runner = _Runner([_probe_rows({table: {}})])
     TrinoSampler(runner).sample_all([(table, [(column, "varchar")])], catalog="c", schema="s")
     stmt = runner.statements[0]
     # Doubled where it is DATA (the table label, the key array), raw inside
@@ -244,7 +381,7 @@ def test_a_crafted_name_cannot_rewrite_the_statement() -> None:
     redirect the arm at another relation, whose rows would otherwise land in
     distinct_values and from there in the Tier-2 prompt."""
     payload = "x' AS tbl, cast(map(ARRAY['a'],ARRAY[(SELECT 1)]) AS json) AS v FROM other --"
-    runner = _Runner([_json_rows({payload: {}})])
+    runner = _Runner([_probe_rows({payload: {}})])
     TrinoSampler(runner).sample_all([(payload, [("a", "varchar")])], catalog="c", schema="s")
     stmt = runner.statements[0]
     # The payload survives only inside a properly closed literal and a properly
@@ -263,6 +400,6 @@ def test_the_runner_is_required() -> None:
 def test_the_cardinality_pass_casts_to_json() -> None:
     """The statement runner's contract is str|None rows, so a native MAP would
     decode differently per client."""
-    runner = _Runner([_json_rows({"orders": {"status": 3}}), _json_rows({"orders": {"status": ["F"]}})])
+    runner = _Runner([_probe_rows({"orders": {"status": 3}}), _json_rows({"orders": {"status": ["F"]}})])
     TrinoSampler(runner).sample_all([("orders", [("status", "varchar")])], catalog="c", schema="s")
     assert "AS json" in runner.statements[0]

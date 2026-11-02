@@ -14,12 +14,22 @@ which is why its own docstring flags a Lambda-timeout risk at scale. Trino does
 not need that: one statement can carry every candidate column of every table,
 since the per-column aggregates collapse into a map and the tables into a UNION
 ALL. Sampling therefore costs TWO queries for a whole schema rather than one per
-column, which is what makes it affordable here at all — this connector's
-discovery is deliberately a fixed number of queries regardless of schema size.
+column, and each pass reads a table once no matter how many of its columns are
+candidates.
 
 Two passes rather than one, because ``array_agg(DISTINCT col)`` accumulates every
 value it encounters: ``approx_distinct`` is the cheap probe that decides which
 columns are small enough to collect.
+
+Both passes read at most :data:`PROBE_MAX_ROWS` rows per table, and the gate and
+the collection apply the same bounds ``AthenaSampler`` does — the cap, the
+repetition factor, the value-shape backstop and the per-value length cap all come
+from :mod:`dialects`, so a column treated as categorical on a Glue source is
+treated that way here. The cap is what makes cost O(rows read) rather than
+O(table): without it a 100M-row fact table costs two full scans to learn 25
+values, and the consequence is the one ``probe_gate_sql`` documents — a value
+rarer than the cap is invisible, so the collected set describes a prefix of the
+table rather than all of it.
 """
 
 from __future__ import annotations
@@ -30,7 +40,12 @@ import structlog
 
 from coa_sources.database.metrics import emit_metric
 
-from .dialects import MAX_ENUM_DISTINCT
+from .dialects import (
+    MAX_ENUM_DISTINCT,
+    MIN_REPETITION_FACTOR,
+    PROBE_MAX_ROWS,
+    values_look_categorical,
+)
 from .trino_statement import TrinoStatementRunner, quote_ident, quote_literal
 
 logger = structlog.get_logger(__name__)
@@ -42,6 +57,11 @@ _SAMPLEABLE_TYPE_PREFIXES = ("char", "varchar", "text", "string")
 # Ceiling on candidates per statement. A wide schema becomes a few bounded
 # statements instead of one whose text grows without limit.
 MAX_COLUMNS_PER_QUERY = 60
+
+# Matches AthenaSampler's own truncation. A low-cardinality column of long values
+# is already rejected by values_look_categorical; this bounds what a value that
+# passes can contribute to the prompt.
+_MAX_VALUE_CHARS = 100
 
 
 def is_sampleable_type(data_type: str) -> bool:
@@ -67,11 +87,13 @@ class TrinoSampler:
         *,
         max_distinct: int = MAX_ENUM_DISTINCT,
         max_columns_per_query: int = MAX_COLUMNS_PER_QUERY,
+        row_cap: int = PROBE_MAX_ROWS,
     ) -> None:
-        """Wire the statement runner and the cardinality/width bounds."""
+        """Wire the statement runner and the cardinality/width/row bounds."""
         self._runner = runner
         self._max_distinct = max_distinct
         self._max_columns_per_query = max(1, max_columns_per_query)
+        self._row_cap = max(1, row_cap)
 
     def sample_all(
         self,
@@ -97,15 +119,12 @@ class TrinoSampler:
         out: dict[str, dict[str, list[str]]] = {}
         for chunk in self._chunk(candidates):
             try:
-                counts = self._run_pass(chunk, "approx_distinct", catalog, schema, timeout_seconds)
-                small = [
-                    (table, [c for c in cols if 0 < int(counts.get(table, {}).get(c, -1) or -1) <= self._max_distinct])
-                    for table, cols in chunk
-                ]
+                probed = self._probe(chunk, catalog, schema, timeout_seconds)
+                small = [(t, [c for c in cols if self._is_enum_like(probed.get(t, {}).get(c))]) for t, cols in chunk]
                 small = [(t, cols) for t, cols in small if cols]
                 if not small:
                     continue
-                values = self._run_pass(small, "array_agg_distinct", catalog, schema, timeout_seconds)
+                collected = self._collect(small, catalog, schema, timeout_seconds)
             except Exception:
                 emit_metric("TrinoSamplingFailed", 1, "Count")
                 logger.warning(
@@ -116,11 +135,11 @@ class TrinoSampler:
                     exc_info=True,
                 )
                 continue
-            for table, cols in values.items():
-                bucket = out.setdefault(table, {})
+            for table, cols in collected.items():
                 for col, vals in cols.items():
-                    if isinstance(vals, list):
-                        bucket[col] = [str(v) for v in vals if v is not None]
+                    values = self._clean(vals)
+                    if values:
+                        out.setdefault(table, {})[col] = values
         return out
 
     def _chunk(self, candidates: list[tuple[str, list[str]]]) -> list[list[tuple[str, list[str]]]]:
@@ -145,28 +164,107 @@ class TrinoSampler:
             chunks.append(current)
         return chunks
 
-    def _run_pass(
+    def _is_enum_like(self, probe: tuple[int, int] | None) -> bool:
+        """Whether ``(distinct, non_null_rows)`` describes a category column.
+
+        The repetition factor is what excludes a unique-identifier column, which
+        a distinct ceiling alone admits in any table smaller than the ceiling: 25
+        rows of 25 distinct order ids would otherwise reach the prompt as
+        ``allowed values``. Same gate ``AthenaSampler`` applies.
+        """
+        if not probe:
+            return False
+        distinct, non_null = probe
+        return 0 < distinct <= self._max_distinct and non_null >= MIN_REPETITION_FACTOR * distinct
+
+    def _clean(self, values: object) -> list[str]:
+        """Drop nulls and blanks, truncate, then apply the value-shape backstop.
+
+        Truncation precedes the shape check, as in ``AthenaSampler``: the check's
+        own length threshold is well below the cap, so free text still fails it.
+        """
+        if not isinstance(values, list):
+            return []
+        cleaned = [str(v)[:_MAX_VALUE_CHARS] for v in values if v is not None and str(v) != ""]
+        return cleaned if values_look_categorical(cleaned) else []
+
+    def _scan(self, table: str, cols: list[str]) -> str:
+        """A row-capped subquery projecting only ``cols``.
+
+        One scan serves every aggregate over it, which is the whole efficiency of
+        this sampler against the per-column fan-out. No ``ORDER BY``: that would
+        reintroduce a full sort, and the prefix only has to answer "does this
+        column hold a small set of repeated labels".
+        """
+        projected = ", ".join(quote_ident(c) for c in cols)
+        return f"(SELECT {projected} FROM {quote_ident(table)} LIMIT {self._row_cap}) probe_sample"
+
+    def _probe(
         self,
         chunk: list[tuple[str, list[str]]],
-        mode: str,
+        catalog: str,
+        schema: str,
+        timeout_seconds: float | None,
+    ) -> dict[str, dict[str, tuple[int, int]]]:
+        """Cardinality and non-null count per column, one statement per chunk."""
+        arms = []
+        for table, cols in chunk:
+            keys = ", ".join(quote_literal(c) for c in cols)
+            distincts = ", ".join(f"approx_distinct({quote_ident(c)})" for c in cols)
+            # count(c), not count(*): the repetition factor has to compare against
+            # this column's non-null values, or a mostly-null column reads as
+            # repetitive on the strength of other columns' rows.
+            non_nulls = ", ".join(f"count({quote_ident(c)})" for c in cols)
+            arms.append(
+                f"SELECT {quote_literal(table)} AS tbl, "
+                f"cast(map(ARRAY[{keys}], ARRAY[{distincts}]) AS json) AS d, "
+                f"cast(map(ARRAY[{keys}], ARRAY[{non_nulls}]) AS json) AS n "
+                f"FROM {self._scan(table, cols)}"
+            )
+        rows = self._runner.run(
+            "\nUNION ALL\n".join(arms),
+            catalog=catalog,
+            schema=schema,
+            timeout_seconds=timeout_seconds,
+        )
+        out: dict[str, dict[str, tuple[int, int]]] = {}
+        for row in rows:
+            if not row or len(row) < 3 or row[0] is None or row[1] is None or row[2] is None:
+                continue
+            try:
+                distinct_map, non_null_map = json.loads(row[1]), json.loads(row[2])
+            except (TypeError, ValueError):
+                logger.debug("trino_enum_sampling_unparseable_row", table=row[0])
+                continue
+            if not isinstance(distinct_map, dict) or not isinstance(non_null_map, dict):
+                continue
+            out[str(row[0])] = {
+                col: (_as_int(distinct_map.get(col)), _as_int(non_null_map.get(col))) for col in distinct_map
+            }
+        return out
+
+    def _collect(
+        self,
+        chunk: list[tuple[str, list[str]]],
         catalog: str,
         schema: str,
         timeout_seconds: float | None,
     ) -> dict[str, dict]:
-        """Issue one UNION ALL statement for ``chunk`` and parse its JSON maps."""
+        """Distinct values for the columns that passed, one statement per chunk.
+
+        Reads the same capped prefix the probe did, so the values are the ones its
+        counts described rather than a set the gate never saw.
+        """
         arms = []
         for table, cols in chunk:
             keys = ", ".join(quote_literal(c) for c in cols)
-            if mode == "approx_distinct":
-                aggs = ", ".join(f"approx_distinct({quote_ident(c)})" for c in cols)
-            else:
-                aggs = ", ".join(f"array_agg(DISTINCT {quote_ident(c)})" for c in cols)
+            aggs = ", ".join(f"array_agg(DISTINCT {quote_ident(c)})" for c in cols)
             # Cast to json so the row stays a string: the statement runner's
             # contract is str|None, and a native MAP would decode per client.
             arms.append(
                 f"SELECT {quote_literal(table)} AS tbl, "
                 f"cast(map(ARRAY[{keys}], ARRAY[{aggs}]) AS json) AS v "
-                f"FROM {quote_ident(table)}"
+                f"FROM {self._scan(table, cols)}"
             )
         rows = self._runner.run(
             "\nUNION ALL\n".join(arms),
@@ -179,7 +277,26 @@ class TrinoSampler:
             if not row or len(row) < 2 or row[0] is None or row[1] is None:
                 continue
             try:
-                parsed[str(row[0])] = json.loads(row[1])
+                values = json.loads(row[1])
             except (TypeError, ValueError):
                 logger.debug("trino_enum_sampling_unparseable_row", table=row[0])
+                continue
+            if isinstance(values, dict):
+                parsed[str(row[0])] = values
         return parsed
+
+
+def _as_int(value: object) -> int:
+    """Coerce a JSON number to int, treating anything unusable as zero.
+
+    Zero fails the gate, so an unreadable count leaves the column unsampled
+    rather than collected on the strength of a value nobody could parse.
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0

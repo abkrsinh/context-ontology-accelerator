@@ -58,7 +58,6 @@ from .trino_statement import (
     TrinoConfigError,
     TrinoStatementError,
     TrinoStatementRunner,
-    quote_ident,
 )
 
 logger = structlog.get_logger(__name__)
@@ -184,7 +183,12 @@ def _fetch_secret(secret_arn: str, region: str) -> dict:
         raise
     if "SecretString" not in response:
         raise TrinoConfigError("Trino credential secret must be a string, not binary")
-    return json.loads(response["SecretString"])
+    secret = json.loads(response["SecretString"])
+    # A JSON scalar or array parses fine and then fails as an AttributeError on
+    # the first `.get`, which reads as a bug here rather than a bad secret.
+    if not isinstance(secret, dict):
+        raise TrinoConfigError("Trino credential secret must be a JSON object")
+    return secret
 
 
 def _default_runner_factory(config: dict) -> TrinoStatementRunner:
@@ -514,4 +518,4 @@ class TrinoConnector:
         )
 
 
-__all__ = ["SchemaNotFoundError", "TrinoConnector", "quote_ident"]
+__all__ = ["SchemaNotFoundError", "TrinoConnector"]

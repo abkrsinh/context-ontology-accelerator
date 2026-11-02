@@ -104,8 +104,9 @@ def validate_url(
             was refused.
 
     Raises:
-        UrlGuardError: wrong scheme, no hostname, a non-ASCII hostname,
-            unresolvable, or any resolved address refused by either gate.
+        UrlGuardError: wrong scheme, no hostname, a non-ASCII hostname, a port
+            outside 1-65535, unresolvable, or any resolved address refused by
+            either gate.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in _ALLOWED_SCHEMES:
@@ -120,6 +121,16 @@ def validate_url(
         raise UrlGuardError(f"{field_name} hostname must be ASCII; supply punycode explicitly")
 
     hostname = parsed.hostname
+    # urlparse defers port parsing to attribute access, so an out-of-range port
+    # raises a bare ValueError that a caller catching UrlGuardError would miss.
+    # Port 0 is refused rather than left to the `or` below, which reads it as 443.
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise UrlGuardError(f"{field_name} port must be between 1 and 65535") from exc
+    if port == 0:
+        raise UrlGuardError(f"{field_name} port must be between 1 and 65535")
+
     try:
         # Resolved ONCE. Every later use is of a validated address, which is
         # what removes the rebinding window.
@@ -142,4 +153,4 @@ def validate_url(
         if not ip.is_global and not allowlisted:
             raise UrlGuardError(f"{field_name} resolves to a non-routable address and its host is not allowlisted")
 
-    return ValidatedUrl(hostname=hostname, port=parsed.port or _DEFAULT_PORT)
+    return ValidatedUrl(hostname=hostname, port=port or _DEFAULT_PORT)

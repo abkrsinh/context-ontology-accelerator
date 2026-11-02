@@ -51,6 +51,10 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_TRINO_ALLOWED_HOSTS:-}" ] && CONTEXT="$CONTEXT --context trino_allowed_hosts=$SCL_TRINO_ALLOWED_HOSTS"
 # Gates construction of the serve-side Trino executor; unset leaves TRINO sources on Athena.
 [ -n "${SCL_TRINO_SOURCE_ENABLED:-}" ] && CONTEXT="$CONTEXT --context trino_source_enabled=$SCL_TRINO_SOURCE_ENABLED"
+# Lets Trino discovery read table DATA to collect categorical values; metadata-only without it.
+[ -n "${SCL_TRINO_SAMPLE_DISTINCT_VALUES:-}" ] && CONTEXT="$CONTEXT --context trino_sample_distinct_values=$SCL_TRINO_SAMPLE_DISTINCT_VALUES"
+# Shortens the window a rotated Trino credential stays in use; the executor caps it at 900.
+[ -n "${SCL_TRINO_SECRET_CACHE_TTL_S:-}" ] && CONTEXT="$CONTEXT --context trino_secret_cache_ttl_s=$SCL_TRINO_SECRET_CACHE_TTL_S"
 # Optional: enables the OoPS! pitfall scan, which sends the serialised ontology to this endpoint.
 [ -n "${SCL_OOPS_ENDPOINT:-}" ] && CONTEXT="$CONTEXT --context oops_endpoint=$SCL_OOPS_ENDPOINT"
 
